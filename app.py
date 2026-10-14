@@ -7,11 +7,24 @@ import streamlit as st
 
 
 # ==========================================
-# 1. FUNKCJE PARSUJĄCE Z CACHEM (IO & GPS)
+# 1. FUNKCJE GEODEZYJNE I PARSUJĄCE
 # ==========================================
+def haversine_distance_m(lat1, lon1, lat2, lon2):
+    """Oblicza dokładną odległość w metrach na elipsoidzie WGS84 (wzór Haversine'a)."""
+    R = 6371000.0  # Promień Ziemi w metrach
+    phi1, phi2 = np.radians(lat1), np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+    a = (
+        np.sin(dphi / 2.0) ** 2
+        + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0) ** 2
+    )
+    return float(2.0 * R * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a)))
+
+
 @st.cache_data
 def load_rsp_data(file_bytes, file_name):
-    """Wczytuje i keszuje dane RSP z wykorzystaniem io.BytesIO."""
+    """Wczytuje i keszuje dane RSP."""
     if file_name.lower().endswith(".csv"):
         df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python")
     else:
@@ -22,7 +35,7 @@ def load_rsp_data(file_bytes, file_name):
 
 @st.cache_data
 def parse_rsp_gps_cached(file_bytes, file_name):
-    """Szybki, keszowany parser pliku GPS z profilografu RSP (.xlsx / .csv / .txt)."""
+    """Szybki, keszowany parser pliku GPS z profilografu RSP."""
     if file_name.lower().endswith(".csv") or file_name.lower().endswith(".txt"):
         try:
             df = pd.read_csv(
@@ -39,7 +52,6 @@ def parse_rsp_gps_cached(file_bytes, file_name):
             df_clean[col].astype(str).str.replace(",", "."), errors="coerce"
         )
 
-    # Automatyczne wykrywanie kolumn LAT (~48-56 N) i LON (~13-25 E)
     lat_col, lon_col = None, None
     for col in df_clean.columns:
         vals = df_clean[col].dropna()
@@ -51,9 +63,9 @@ def parse_rsp_gps_cached(file_bytes, file_name):
                 lon_col = col
 
     if lat_col is None:
-        lat_col = 5  # Domyślnie kolumna F w Excelu RSP
+        lat_col = 5
     if lon_col is None:
-        lon_col = 6  # Domyślnie kolumna G w Excelu RSP
+        lon_col = 6
 
     res = pd.DataFrame({
         "LAT": df_clean[lat_col],
@@ -154,7 +166,7 @@ def parse_lcms_excel_cached(file_bytes, file_name):
 
             x_full = np.concatenate([x_left, x_right])
             if len(x_full) > 0 and np.max(np.abs(x_full)) > 20:
-                x_full = x_full / 1000.0  # mm na metry
+                x_full = x_full / 1000.0
 
             z_full = np.concatenate([z_left, z_right])
 
@@ -282,11 +294,21 @@ def compute_all_rsp_ruts_cached(df_rsp, x_vals_tuple):
     })
 
 
-def make_map_trace(lat, lon, mode, marker, line=None, name="", text=None):
-    """Kreator warstwy mapy kompatybilny z każdą wersją Plotly."""
-    kwargs = {"lat": lat, "lon": lon, "mode": mode, "marker": marker, "name": name}
+def make_map_trace(
+    lat, lon, mode="lines", marker=None, line=None, name="", text=None
+):
+    """Kreator warstwy mapy odporny na niekompatybilne parametry linii w Plotly Scattermap."""
+    kwargs = {"lat": lat, "lon": lon, "mode": mode, "name": name}
+    if marker is not None:
+        kwargs["marker"] = marker
+
     if line is not None:
-        kwargs["line"] = line
+        clean_line = line.copy()
+        # Scattermap/Scattermapbox nie wspierają właściwości 'dash' w słowniku line
+        if hasattr(go, "Scattermap") or hasattr(go, "Scattermapbox"):
+            clean_line.pop("dash", None)
+        kwargs["line"] = clean_line
+
     if text is not None:
         kwargs["text"] = text
         kwargs["hoverinfo"] = "text"
@@ -774,14 +796,12 @@ if uploaded_rsp is not None:
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # Longitudinal Charts Comparison (RSP vs LCMS)
+        # Longitudinal Charts Comparison
         st.markdown("---")
         st.subheader("📈 Przebieg Kolein na Całej Trasie (RSP vs LCMS)")
 
-        # 1. Przetworzenie całej trasy RSP
         df_all_rsp_ruts = compute_all_rsp_ruts_cached(df_rsp, tuple(x_vals))
 
-        # 2. Dane LCMS z uwzględnieniem offsetu pikietażu
         has_lcms = lcms_profiles is not None and len(lcms_profiles) > 0
         if has_lcms:
             list_lcms_p = sorted(lcms_profiles.keys())
@@ -790,7 +810,6 @@ if uploaded_rsp is not None:
             lcms_rut_max = np.maximum(lcms_rut_l, lcms_rut_r)
             lcms_p_shifted = [p - offset_pikitaz for p in list_lcms_p]
 
-        # Tworzenie 4 Zakładek
         tab_l, tab_r, tab_max, tab_all = st.tabs([
             "👈 Koleina Lewa (RSP vs LCMS)",
             "👉 Koleina Prawa (RSP vs LCMS)",
@@ -798,7 +817,6 @@ if uploaded_rsp is not None:
             "📊 Zbiorcze (Wszystkie)",
         ])
 
-        # TAB 1: KOLEINA LEWA
         with tab_l:
             fig_l = go.Figure()
             fig_l.add_trace(
@@ -835,7 +853,6 @@ if uploaded_rsp is not None:
             )
             st.plotly_chart(fig_l, use_container_width=True)
 
-        # TAB 2: KOLEINA PRAWA
         with tab_r:
             fig_r = go.Figure()
             fig_r.add_trace(
@@ -872,7 +889,6 @@ if uploaded_rsp is not None:
             )
             st.plotly_chart(fig_r, use_container_width=True)
 
-        # TAB 3: KOLEINA MAKSYMALNA
         with tab_max:
             fig_m = go.Figure()
             fig_m.add_trace(
@@ -909,7 +925,6 @@ if uploaded_rsp is not None:
             )
             st.plotly_chart(fig_m, use_container_width=True)
 
-        # TAB 4: ZBIORCZE (WSZYSTKIE ŚLADY)
         with tab_all:
             fig_all = go.Figure()
             fig_all.add_trace(
@@ -966,15 +981,83 @@ if uploaded_rsp is not None:
             )
             st.plotly_chart(fig_all, use_container_width=True)
 
-        # Map GPS (Dwa Ślady: RSP + LCMS)
+        # Map GPS & Spatial Distance Analysis
         if df_rsp_gps is not None or df_xml_gps is not None:
             st.markdown("---")
-            st.subheader("🗺️ Pozycja Profilu na Mapie GPS")
+            st.subheader("🗺️ Analiza Pozycji GPS i Przesunięcia Terenowego")
+
+            idx_rsp_gps = (
+                min(max(0, wybrany_profil - min_p), len(df_rsp_gps) - 1)
+                if df_rsp_gps is not None
+                else None
+            )
+            row_rsp_gps = (
+                df_rsp_gps.iloc[idx_rsp_gps] if idx_rsp_gps is not None else None
+            )
+
+            idx_lcms_gps = (
+                min(max(0, wybrany_profil_lcms - 1), len(df_xml_gps) - 1)
+                if df_xml_gps is not None
+                else None
+            )
+            row_lcms_gps = (
+                df_xml_gps.iloc[idx_lcms_gps]
+                if idx_lcms_gps is not None
+                else None
+            )
+
+            dist_m = None
+            if row_rsp_gps is not None and row_lcms_gps is not None:
+                dist_m = haversine_distance_m(
+                    row_rsp_gps["LAT"],
+                    row_rsp_gps["LON"],
+                    row_lcms_gps["LAT"],
+                    row_lcms_gps["LON"],
+                )
+
+                lats_lcms = df_xml_gps["LAT"].values
+                lons_lcms = df_xml_gps["LON"].values
+                dists_all = [
+                    haversine_distance_m(
+                        row_rsp_gps["LAT"], row_rsp_gps["LON"], la, lo
+                    )
+                    for la, lo in zip(lats_lcms, lons_lcms)
+                ]
+                best_match_idx = int(np.argmin(dists_all))
+                best_match_dist = dists_all[best_match_idx]
+                sugerowany_offset = (best_match_idx + 1) - wybrany_profil
+
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric(
+                    "Rozbieżność GPS (Obecny Offset)",
+                    f"{dist_m:.2f} m",
+                    delta=f"Przesunięcie: {offset_pikitaz} profili",
+                )
+                mc2.metric(
+                    "Sugerowane Przesunięcie Pikietażu",
+                    f"{sugerowany_offset:+} profili",
+                    delta_color="normal",
+                )
+                mc3.metric(
+                    "Najmniejsza Odległość Przestrzenna",
+                    f"{best_match_dist:.2f} m",
+                    f"Dla punktu LCMS #{best_match_idx + 1}",
+                )
 
             fig_map = go.Figure()
             center_lat, center_lon = 52.0, 19.0
 
-            # 1. Ślad GPS z RSP
+            if row_rsp_gps is not None:
+                center_lat, center_lon = (
+                    row_rsp_gps["LAT"],
+                    row_rsp_gps["LON"],
+                )
+            elif row_lcms_gps is not None:
+                center_lat, center_lon = (
+                    row_lcms_gps["LAT"],
+                    row_lcms_gps["LON"],
+                )
+
             if df_rsp_gps is not None:
                 fig_map.add_trace(
                     make_map_trace(
@@ -983,22 +1066,13 @@ if uploaded_rsp is not None:
                         mode="markers+lines",
                         marker=dict(size=5, color="royalblue"),
                         line=dict(width=2, color="royalblue"),
-                        name="Trasa RSP GPS",
+                        name="Trasa RSP GPS (135 pkt)",
                         text=[
                             f"Profil RSP: {p_i}"
                             for p_i in df_rsp_gps["Profil_idx"]
                         ],
                     )
                 )
-                idx_rsp_gps = min(
-                    max(0, wybrany_profil - min_p), len(df_rsp_gps) - 1
-                )
-                row_rsp_gps = df_rsp_gps.iloc[idx_rsp_gps]
-                center_lat, center_lon = (
-                    row_rsp_gps["LAT"],
-                    row_rsp_gps["LON"],
-                )
-
                 fig_map.add_trace(
                     make_map_trace(
                         lat=[row_rsp_gps["LAT"]],
@@ -1006,20 +1080,19 @@ if uploaded_rsp is not None:
                         mode="markers",
                         marker=dict(size=14, color="red"),
                         name=f"Profil RSP {wybrany_profil}",
-                        text=[f"Pozycja Profilu RSP nr {wybrany_profil}"],
+                        text=[f"Pozycja RSP nr {wybrany_profil}"],
                     )
                 )
 
-            # 2. Ślad GPS z LCMS (XML)
             if df_xml_gps is not None:
                 fig_map.add_trace(
                     make_map_trace(
                         lat=df_xml_gps["LAT"],
                         lon=df_xml_gps["LON"],
                         mode="markers+lines",
-                        marker=dict(size=5, color="forestgreen"),
-                        line=dict(width=2, color="forestgreen"),
-                        name="Trasa LCMS XML",
+                        marker=dict(size=4, color="forestgreen"),
+                        line=dict(width=1.5, color="forestgreen"),
+                        name="Trasa LCMS XML (2354 pkt)",
                         text=[
                             f"Pikietaż LCMS: {st_m:.1f}m<br>Plik: {fn}"
                             for st_m, fn in zip(
@@ -1028,17 +1101,6 @@ if uploaded_rsp is not None:
                         ],
                     )
                 )
-                idx_lcms_gps = min(
-                    max(0, wybrany_profil_lcms - 1), len(df_xml_gps) - 1
-                )
-                row_lcms_gps = df_xml_gps.iloc[idx_lcms_gps]
-
-                if df_rsp_gps is None:
-                    center_lat, center_lon = (
-                        row_lcms_gps["LAT"],
-                        row_lcms_gps["LON"],
-                    )
-
                 fig_map.add_trace(
                     make_map_trace(
                         lat=[row_lcms_gps["LAT"]],
@@ -1053,8 +1115,27 @@ if uploaded_rsp is not None:
                     )
                 )
 
+            if (
+                row_rsp_gps is not None
+                and row_lcms_gps is not None
+                and dist_m is not None
+            ):
+                fig_map.add_trace(
+                    make_map_trace(
+                        lat=[row_rsp_gps["LAT"], row_lcms_gps["LAT"]],
+                        lon=[row_rsp_gps["LON"], row_lcms_gps["LON"]],
+                        mode="lines",
+                        line=dict(color="crimson", width=3),
+                        name=f"Przesunięcie terenowe: {dist_m:.2f} m",
+                        text=[
+                            f"Przesunięcie pozycji: {dist_m:.2f} m",
+                            f"Przesunięcie pozycji: {dist_m:.2f} m",
+                        ],
+                    )
+                )
+
             map_config = dict(
-                center=dict(lat=center_lat, lon=center_lon), zoom=14
+                center=dict(lat=center_lat, lon=center_lon), zoom=15
             )
 
             try:
@@ -1063,18 +1144,18 @@ if uploaded_rsp is not None:
                         map_style="open-street-map",
                         map=map_config,
                         margin=dict(l=0, r=0, t=20, b=0),
-                        height=450,
+                        height=480,
                     )
                 else:
                     fig_map.update_layout(
                         mapbox_style="open-street-map",
                         mapbox=map_config,
                         margin=dict(l=0, r=0, t=20, b=0),
-                        height=450,
+                        height=480,
                     )
             except Exception:
                 fig_map.update_layout(
-                    margin=dict(l=0, r=0, t=20, b=0), height=450
+                    margin=dict(l=0, r=0, t=20, b=0), height=480
                 )
 
             st.plotly_chart(fig_map, use_container_width=True)
