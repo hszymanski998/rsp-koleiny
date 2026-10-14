@@ -7,11 +7,11 @@ import streamlit as st
 
 
 # ==========================================
-# 1. FUNKCJE PARSUJĄCE Z CACHEM (POPRAWIONE IO)
+# 1. FUNKCJE PARSUJĄCE I WYGŁADZAJĄCE Z CACHEM
 # ==========================================
 @st.cache_data
 def load_rsp_data(file_bytes, file_name):
-    """Wczytuje i keszuje dane RSP."""
+    """Wczytuje i keszuje dane RSP z wykorzystaniem io.BytesIO."""
     if file_name.lower().endswith(".csv"):
         df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python")
     else:
@@ -22,7 +22,7 @@ def load_rsp_data(file_bytes, file_name):
 
 @st.cache_data
 def parse_lcms_excel_cached(file_bytes, file_name):
-    """Szybki, keszowany parser pliku LCMS Excel/CSV z io.BytesIO."""
+    """Szybki, keszowany parser pliku LCMS z czyszczeniem danych."""
     if file_name.lower().endswith(".csv"):
         df_lcms_raw = pd.read_csv(
             io.BytesIO(file_bytes), header=None, sep=None, engine="python"
@@ -73,53 +73,30 @@ def parse_lcms_excel_cached(file_bytes, file_name):
                 else 0.0
             )
 
-            x_left = (
-                pd.to_numeric(
-                    df_lcms_raw.iloc[r_left_h, 3:]
-                    .astype(str)
-                    .str.replace(",", "."),
-                    errors="coerce",
-                )
-                .dropna()
-                .values
-            )
-            z_left = (
-                pd.to_numeric(
-                    df_lcms_raw.iloc[r_left_d, 3:]
-                    .astype(str)
-                    .str.replace(",", "."),
-                    errors="coerce",
-                )
-                .dropna()
-                .values
-            )
+            x_left = pd.to_numeric(
+                df_lcms_raw.iloc[r_left_h, 3:].astype(str).str.replace(",", "."),
+                errors="coerce",
+            ).values
+            z_left = pd.to_numeric(
+                df_lcms_raw.iloc[r_left_d, 3:].astype(str).str.replace(",", "."),
+                errors="coerce",
+            ).values
 
-            x_right = (
-                pd.to_numeric(
-                    df_lcms_raw.iloc[r_right_h, 3:]
-                    .astype(str)
-                    .str.replace(",", "."),
-                    errors="coerce",
-                )
-                .dropna()
-                .values
-            )
-            z_right = (
-                pd.to_numeric(
-                    df_lcms_raw.iloc[r_right_d, 3:]
-                    .astype(str)
-                    .str.replace(",", "."),
-                    errors="coerce",
-                )
-                .dropna()
-                .values
-            )
+            x_right = pd.to_numeric(
+                df_lcms_raw.iloc[r_right_h, 3:].astype(str).str.replace(",", "."),
+                errors="coerce",
+            ).values
+            z_right = pd.to_numeric(
+                df_lcms_raw.iloc[r_right_d, 3:].astype(str).str.replace(",", "."),
+                errors="coerce",
+            ).values
 
-            min_len_l = min(len(x_left), len(z_left))
-            x_left, z_left = x_left[:min_len_l], z_left[:min_len_l]
+            # Odrzucanie braków danych NaN
+            valid_l = ~np.isnan(x_left) & ~np.isnan(z_left)
+            x_left, z_left = x_left[valid_l], z_left[valid_l]
 
-            min_len_r = min(len(x_right), len(z_right))
-            x_right, z_right = x_right[:min_len_r], z_right[:min_len_r]
+            valid_r = ~np.isnan(x_right) & ~np.isnan(z_right)
+            x_right, z_right = x_right[valid_r], z_right[valid_r]
 
             x_full = np.concatenate([x_left, x_right])
             if len(x_full) > 0 and np.max(np.abs(x_full)) > 20:
@@ -174,8 +151,20 @@ def parse_lcms_xml(file_bytes):
     return pd.DataFrame(records)
 
 
+def smooth_profile(z_vals, window_size=31):
+    """Filtruje makrostrukturę kruszywa i szum lasera filtrem średniej kroczącej."""
+    if len(z_vals) < window_size:
+        return z_vals
+    return (
+        pd.Series(z_vals)
+        .rolling(window=window_size, center=True, min_periods=1)
+        .mean()
+        .values
+    )
+
+
 def get_upper_hull_pts(x_sec, y_sec):
-    """Wyznacza punkty kontaktowe górnej otoczki wypukłej."""
+    """Wyznacza punkty kontaktowe górnej otoczki wypukłej (Wirtualna Łata)."""
     pts = sorted(list(zip(x_sec, y_sec)), key=lambda p: p[0])
     upper = []
     for p in pts:
@@ -223,7 +212,7 @@ def make_map_trace(lat, lon, mode, marker, line=None, name="", text=None):
 st.set_page_config(
     page_title="RSP vs LCMS – Szybka Analiza Kolein", layout="wide"
 )
-st.title("⚡ Szybki System Analizy RSP + LCMS (DSN 2019)")
+st.title("⚡ System Analizy RSP + LCMS (DSN 2019)")
 
 # ==========================================
 # 3. PANEL BOCZNY
@@ -300,11 +289,11 @@ wyrownaj_spadek_lcms = st.sidebar.checkbox(
 )
 pokaz_late_lcms = st.sidebar.checkbox("Pokaż łatę i koleiny LCMS", value=True)
 
-# Parsowanie plików dodatkowych z pamięci podręcznej (RAM)
+# Parsowanie plików dodatkowych
 lcms_profiles = None
 if uploaded_lcms is not None:
     try:
-        with st.spinner("Przetwarzanie pliku LCMS (tylko pierwsze wczytanie)..."):
+        with st.spinner("Przetwarzanie pliku LCMS..."):
             lcms_profiles = parse_lcms_excel_cached(
                 uploaded_lcms.getvalue(), uploaded_lcms.name
             )
@@ -524,7 +513,7 @@ if uploaded_rsp is not None:
             )
             fig.add_annotation(
                 x=x_kp,
-                y=(y_kp_lata + y_kp_prof) / 2,
+                y=(y_kp_prof + y_kp_lata) / 2,
                 text=f" <b>{koleina_prawa_mm:.1f} mm</b>",
                 showarrow=False,
                 font=dict(color="darkorange", size=13),
@@ -534,50 +523,47 @@ if uploaded_rsp is not None:
                 xanchor="left" if x_kp > 0 else "right",
             )
 
-        # LCMS Plot & Precyzyjne Prostowanie Na Bazie Otoczki Wypukłej
+        # LCMS Plot & Precyzyjne Wygładzanie i Prostowanie
         if prof_lcms_data is not None:
-            x_lcms = prof_lcms_data["x"]
+            x_lcms_raw = prof_lcms_data["x"]
             z_lcms_raw = prof_lcms_data["z"]
 
-            if wyrownaj_spadek_lcms:
-                hull_pts = get_upper_hull_pts(x_lcms, z_lcms_raw)
-                x_h = np.array([p[0] for p in hull_pts])
-                z_h = np.array([p[1] for p in hull_pts])
+            # 1. Filtrowanie makrostruktury i kruszywa (wygładzanie oknem 30mm)
+            z_lcms_smooth = smooth_profile(z_lcms_raw, window_size=31)
 
-                if len(x_h) >= 2:
-                    p_hull = np.polyfit(x_h, z_h, 1)
-                    slope_lcms = p_hull[0]
-                    z_lcms_leveled = z_lcms_raw - (slope_lcms * x_lcms)
-                else:
-                    z_lcms_leveled = z_lcms_raw
-
-                idx_mid_lcms = np.argmin(np.abs(x_lcms))
-                z_lcms_plot = z_lcms_leveled - z_lcms_leveled[idx_mid_lcms]
+            # 2. Prostowanie spadku poprzecznego na wygładzonym profilu
+            if wyrownaj_spadek_lcms and len(x_lcms_raw) > 10:
+                p_trend = np.polyfit(x_lcms_raw, z_lcms_smooth, 1)
+                z_lcms_leveled = z_lcms_smooth - (p_trend[0] * x_lcms_raw)
             else:
-                z_lcms_plot = z_lcms_raw
+                z_lcms_leveled = z_lcms_smooth
+
+            # Wyzerowanie do poziomu X = 0 (środek jezdni)
+            idx_mid_lcms = np.argmin(np.abs(x_lcms_raw))
+            z_lcms_plot = z_lcms_leveled - z_lcms_leveled[idx_mid_lcms]
 
             fig.add_trace(
                 go.Scatter(
-                    x=x_lcms,
+                    x=x_lcms_raw,
                     y=z_lcms_plot,
                     mode="lines",
-                    name=f"Profil LCMS nr {wybrany_profil_lcms}",
+                    name=f"Profil LCMS nr {wybrany_profil_lcms} (Wygładzony)",
                     line=dict(color="forestgreen", width=2.5),
                 )
             )
 
-            # Korona i Łata LCMS
-            mid_mask_lcms = (x_lcms >= -0.5) & (x_lcms <= 0.5)
+            # Korona i Łata LCMS na wygładzonym profilu
+            mid_mask_lcms = (x_lcms_raw >= -0.5) & (x_lcms_raw <= 0.5)
             if np.any(mid_mask_lcms):
                 idx_crown_lcms = np.where(mid_mask_lcms)[0][
                     np.argmax(z_lcms_plot[mid_mask_lcms])
                 ]
             else:
-                idx_crown_lcms = np.argmin(np.abs(x_lcms))
+                idx_crown_lcms = idx_mid_lcms
 
-            x_lcms_l = x_lcms[: idx_crown_lcms + 1]
+            x_lcms_l = x_lcms_raw[: idx_crown_lcms + 1]
             z_lcms_l = z_lcms_plot[: idx_crown_lcms + 1]
-            x_lcms_r = x_lcms[idx_crown_lcms:]
+            x_lcms_r = x_lcms_raw[idx_crown_lcms:]
             z_lcms_r = z_lcms_plot[idx_crown_lcms:]
 
             lata_lcms_l_y = get_upper_hull(x_lcms_l, z_lcms_l)
@@ -638,7 +624,7 @@ if uploaded_rsp is not None:
                     xanchor="right" if x_kl_c < 0 else "left",
                 )
 
-                x_kp_c = x_lcms[idx_kol_lcms_r]
+                x_kp_c = x_lcms_raw[idx_kol_lcms_r]
                 y_kp_c_prof = z_lcms_plot[idx_kol_lcms_r]
                 y_kp_c_lata = lata_lcms_r_y[idx_kol_lcms_r_rel]
 
