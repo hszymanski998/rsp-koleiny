@@ -243,6 +243,45 @@ def get_upper_hull(x_sec, y_sec):
     return np.interp(x_sec, x_h, y_h)
 
 
+@st.cache_data
+def compute_all_rsp_ruts_cached(df_rsp, x_vals_tuple):
+    """Oblicza koleiny RSP dla wszystkich profili trasy na potrzeby wykresu podłużnego."""
+    col_profil = "Profil" if "Profil" in df_rsp.columns else df_rsp.columns[0]
+    laser_cols = [c for c in df_rsp.columns if c != col_profil]
+
+    prof_ids = df_rsp[col_profil].values
+    data_mat = df_rsp[laser_cols].values.astype(float)
+
+    ile_laserow = data_mat.shape[1]
+    i_min_mid = int(ile_laserow * 0.3)
+    i_max_mid = int(ile_laserow * 0.7)
+
+    ruts_l = []
+    ruts_r = []
+
+    y_mat = -data_mat
+    x_arr = np.array(x_vals_tuple)
+
+    for row in y_mat:
+        idx_crown = i_min_mid + np.argmax(row[i_min_mid : i_max_mid + 1])
+
+        x_left, y_left = x_arr[: idx_crown + 1], row[: idx_crown + 1]
+        x_right, y_right = x_arr[idx_crown:], row[idx_crown:]
+
+        lata_l = get_upper_hull(x_left, y_left)
+        lata_r = get_upper_hull(x_right, y_right)
+
+        ruts_l.append(float(np.max(lata_l - y_left)))
+        ruts_r.append(float(np.max(lata_r - y_right)))
+
+    return pd.DataFrame({
+        "Profil": prof_ids,
+        "RSP_Rut_L": ruts_l,
+        "RSP_Rut_R": ruts_r,
+        "RSP_Rut_Max": np.maximum(ruts_l, ruts_r),
+    })
+
+
 def make_map_trace(lat, lon, mode, marker, line=None, name="", text=None):
     """Kreator warstwy mapy kompatybilny z każdą wersją Plotly."""
     kwargs = {"lat": lat, "lon": lon, "mode": mode, "marker": marker, "name": name}
@@ -348,7 +387,7 @@ wyrownaj_spadek_lcms = st.sidebar.checkbox(
 )
 pokaz_late_lcms = st.sidebar.checkbox("Pokaż łatę i koleiny LCMS", value=True)
 
-# Parsowanie opcjonalnych plików GPS
+# Parsowanie opcjonalnych plików GPS i LCMS
 df_rsp_gps = None
 if uploaded_rsp_gps is not None:
     try:
@@ -735,51 +774,197 @@ if uploaded_rsp is not None:
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # Longitudinal Chart
-        if lcms_profiles:
-            st.markdown("---")
-            st.subheader("📈 Przebieg Kolein na Całej Trasie (Wykres Podłużny)")
+        # Longitudinal Charts Comparison (RSP vs LCMS)
+        st.markdown("---")
+        st.subheader("📈 Przebieg Kolein na Całej Trasie (RSP vs LCMS)")
 
+        # 1. Przetworzenie całej trasy RSP
+        df_all_rsp_ruts = compute_all_rsp_ruts_cached(df_rsp, tuple(x_vals))
+
+        # 2. Dane LCMS z uwzględnieniem offsetu pikietażu
+        has_lcms = lcms_profiles is not None and len(lcms_profiles) > 0
+        if has_lcms:
             list_lcms_p = sorted(lcms_profiles.keys())
             lcms_rut_l = [lcms_profiles[p]["rut_l"] for p in list_lcms_p]
             lcms_rut_r = [lcms_profiles[p]["rut_r"] for p in list_lcms_p]
+            lcms_rut_max = np.maximum(lcms_rut_l, lcms_rut_r)
             lcms_p_shifted = [p - offset_pikitaz for p in list_lcms_p]
 
-            fig_long = go.Figure()
-            fig_long.add_trace(
-                go.Scatter(
-                    x=lcms_p_shifted,
-                    y=lcms_rut_l,
-                    mode="lines",
-                    name="LCMS Koleina Lewa",
-                    line=dict(color="forestgreen", width=1.5),
-                )
-            )
-            fig_long.add_trace(
-                go.Scatter(
-                    x=lcms_p_shifted,
-                    y=lcms_rut_r,
-                    mode="lines",
-                    name="LCMS Koleina Prawa",
-                    line=dict(color="lightgreen", width=1.5, dash="dot"),
-                )
-            )
+        # Tworzenie 4 Zakładek
+        tab_l, tab_r, tab_max, tab_all = st.tabs([
+            "👈 Koleina Lewa (RSP vs LCMS)",
+            "👉 Koleina Prawa (RSP vs LCMS)",
+            "🔝 Koleina Maksymalna (RSP vs LCMS)",
+            "📊 Zbiorcze (Wszystkie)",
+        ])
 
-            fig_long.add_vline(
+        # TAB 1: KOLEINA LEWA
+        with tab_l:
+            fig_l = go.Figure()
+            fig_l.add_trace(
+                go.Scatter(
+                    x=df_all_rsp_ruts["Profil"],
+                    y=df_all_rsp_ruts["RSP_Rut_L"],
+                    mode="lines",
+                    name="RSP Koleina Lewa",
+                    line=dict(color="royalblue", width=2),
+                )
+            )
+            if has_lcms:
+                fig_l.add_trace(
+                    go.Scatter(
+                        x=lcms_p_shifted,
+                        y=lcms_rut_l,
+                        mode="lines",
+                        name="LCMS Koleina Lewa",
+                        line=dict(color="forestgreen", width=2, dash="dash"),
+                    )
+                )
+            fig_l.add_vline(
                 x=wybrany_profil,
                 line_width=2,
                 line_color="red",
                 annotation_text=f"Profil RSP {wybrany_profil}",
             )
-
-            fig_long.update_layout(
-                title="Porównanie Podłużne Głębokości Kolein [mm] na Długości Trasy",
+            fig_l.update_layout(
+                title="Porównanie Podłużne: KOLEINA LEWA [mm]",
                 xaxis_title="Numer Profilu RSP (Pikietaż)",
                 yaxis_title="Głębokość koleiny [mm]",
-                height=400,
+                height=420,
                 hovermode="x unified",
             )
-            st.plotly_chart(fig_long, use_container_width=True)
+            st.plotly_chart(fig_l, use_container_width=True)
+
+        # TAB 2: KOLEINA PRAWA
+        with tab_r:
+            fig_r = go.Figure()
+            fig_r.add_trace(
+                go.Scatter(
+                    x=df_all_rsp_ruts["Profil"],
+                    y=df_all_rsp_ruts["RSP_Rut_R"],
+                    mode="lines",
+                    name="RSP Koleina Prawa",
+                    line=dict(color="darkorange", width=2),
+                )
+            )
+            if has_lcms:
+                fig_r.add_trace(
+                    go.Scatter(
+                        x=lcms_p_shifted,
+                        y=lcms_rut_r,
+                        mode="lines",
+                        name="LCMS Koleina Prawa",
+                        line=dict(color="limegreen", width=2, dash="dash"),
+                    )
+                )
+            fig_r.add_vline(
+                x=wybrany_profil,
+                line_width=2,
+                line_color="red",
+                annotation_text=f"Profil RSP {wybrany_profil}",
+            )
+            fig_r.update_layout(
+                title="Porównanie Podłużne: KOLEINA PRAWA [mm]",
+                xaxis_title="Numer Profilu RSP (Pikietaż)",
+                yaxis_title="Głębokość koleiny [mm]",
+                height=420,
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_r, use_container_width=True)
+
+        # TAB 3: KOLEINA MAKSYMALNA
+        with tab_max:
+            fig_m = go.Figure()
+            fig_m.add_trace(
+                go.Scatter(
+                    x=df_all_rsp_ruts["Profil"],
+                    y=df_all_rsp_ruts["RSP_Rut_Max"],
+                    mode="lines",
+                    name="RSP Koleina Maksymalna",
+                    line=dict(color="crimson", width=2.5),
+                )
+            )
+            if has_lcms:
+                fig_m.add_trace(
+                    go.Scatter(
+                        x=lcms_p_shifted,
+                        y=lcms_rut_max,
+                        mode="lines",
+                        name="LCMS Koleina Maksymalna",
+                        line=dict(color="forestgreen", width=2.5, dash="dash"),
+                    )
+                )
+            fig_m.add_vline(
+                x=wybrany_profil,
+                line_width=2,
+                line_color="red",
+                annotation_text=f"Profil RSP {wybrany_profil}",
+            )
+            fig_m.update_layout(
+                title="Porównanie Podłużne: KOLEINA MAKSYMALNA [mm]",
+                xaxis_title="Numer Profilu RSP (Pikietaż)",
+                yaxis_title="Głębokość koleiny [mm]",
+                height=420,
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_m, use_container_width=True)
+
+        # TAB 4: ZBIORCZE (WSZYSTKIE ŚLADY)
+        with tab_all:
+            fig_all = go.Figure()
+            fig_all.add_trace(
+                go.Scatter(
+                    x=df_all_rsp_ruts["Profil"],
+                    y=df_all_rsp_ruts["RSP_Rut_L"],
+                    mode="lines",
+                    name="RSP Lewa",
+                    line=dict(color="royalblue", width=2),
+                )
+            )
+            fig_all.add_trace(
+                go.Scatter(
+                    x=df_all_rsp_ruts["Profil"],
+                    y=df_all_rsp_ruts["RSP_Rut_R"],
+                    mode="lines",
+                    name="RSP Prawa",
+                    line=dict(color="darkorange", width=2),
+                )
+            )
+
+            if has_lcms:
+                fig_all.add_trace(
+                    go.Scatter(
+                        x=lcms_p_shifted,
+                        y=lcms_rut_l,
+                        mode="lines",
+                        name="LCMS Lewa",
+                        line=dict(color="forestgreen", width=1.5, dash="dash"),
+                    )
+                )
+                fig_all.add_trace(
+                    go.Scatter(
+                        x=lcms_p_shifted,
+                        y=lcms_rut_r,
+                        mode="lines",
+                        name="LCMS Prawa",
+                        line=dict(color="limegreen", width=1.5, dash="dot"),
+                    )
+                )
+
+            fig_all.add_vline(
+                x=wybrany_profil,
+                line_width=2,
+                line_color="red",
+                annotation_text=f"Profil RSP {wybrany_profil}",
+            )
+            fig_all.update_layout(
+                title="Wszystkie Ślady: RSP (Lewa/Prawa) vs LCMS (Lewa/Prawa)",
+                xaxis_title="Numer Profilu RSP (Pikietaż)",
+                yaxis_title="Głębokość koleiny [mm]",
+                height=450,
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_all, use_container_width=True)
 
         # Map GPS (Dwa Ślady: RSP + LCMS)
         if df_rsp_gps is not None or df_xml_gps is not None:
