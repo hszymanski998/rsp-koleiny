@@ -1,37 +1,35 @@
+import io
 import xml.etree.ElementTree as ET
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
 
 # ==========================================
-# 1. FUNKCJE POMOCNICZE I PARSERY
+# 1. FUNKCJE PARSUJĄCE Z CACHEM (POPRAWIONE IO)
 # ==========================================
-def get_upper_hull(x_sec, y_sec):
-    """Oblicza wirtualną łatę (górną otoczkę wypukłą) DSN 2019."""
-    pts = list(zip(x_sec, y_sec))
-    upper = []
-    for p in pts:
-        while len(upper) >= 2:
-            o, a, b = upper[-2], upper[-1], p
-            cross = (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (
-                b[0] - o[0]
-            )
-            if cross >= 0:
-                upper.pop()
-            else:
-                break
-        upper.append(p)
-
-    x_h = [p[0] for p in upper]
-    y_h = [p[1] for p in upper]
-    return np.interp(x_sec, x_h, y_h)
+@st.cache_data
+def load_rsp_data(file_bytes, file_name):
+    """Wczytuje i keszuje dane RSP."""
+    if file_name.lower().endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python")
+    else:
+        df = pd.read_excel(io.BytesIO(file_bytes))
+    df.columns = df.columns.str.strip()
+    return df
 
 
-def parse_lcms_excel(df_lcms_raw):
-    """Parsuje dwuwierszowe bloki LCMS (X, Z oraz wyliczone koleiny)."""
+@st.cache_data
+def parse_lcms_excel_cached(file_bytes, file_name):
+    """Szybki, keszowany parser pliku LCMS Excel/CSV z io.BytesIO."""
+    if file_name.lower().endswith(".csv"):
+        df_lcms_raw = pd.read_csv(
+            io.BytesIO(file_bytes), header=None, sep=None, engine="python"
+        )
+    else:
+        df_lcms_raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
+
     profiles = {}
     num_rows = len(df_lcms_raw)
 
@@ -176,16 +174,59 @@ def parse_lcms_xml(file_bytes):
     return pd.DataFrame(records)
 
 
+def get_upper_hull_pts(x_sec, y_sec):
+    """Wyznacza punkty kontaktowe górnej otoczki wypukłej."""
+    pts = sorted(list(zip(x_sec, y_sec)), key=lambda p: p[0])
+    upper = []
+    for p in pts:
+        while len(upper) >= 2:
+            o, a, b = upper[-2], upper[-1], p
+            cross = (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (
+                b[0] - o[0]
+            )
+            if cross >= 0:
+                upper.pop()
+            else:
+                break
+        upper.append(p)
+    return upper
+
+
+def get_upper_hull(x_sec, y_sec):
+    """Oblicza wartości wirtualnej łaty DSN 2019 na całej długości sekcji."""
+    upper = get_upper_hull_pts(x_sec, y_sec)
+    x_h = [p[0] for p in upper]
+    y_h = [p[1] for p in upper]
+    return np.interp(x_sec, x_h, y_h)
+
+
+def make_map_trace(lat, lon, mode, marker, line=None, name="", text=None):
+    """Kreator warstwy mapy kompatybilny z każdą wersją Plotly."""
+    kwargs = {"lat": lat, "lon": lon, "mode": mode, "marker": marker, "name": name}
+    if line is not None:
+        kwargs["line"] = line
+    if text is not None:
+        kwargs["text"] = text
+        kwargs["hoverinfo"] = "text"
+
+    if hasattr(go, "Scattermap"):
+        return go.Scattermap(**kwargs)
+    elif hasattr(go, "Scattermapbox"):
+        return go.Scattermapbox(**kwargs)
+    else:
+        return go.Scattergeo(**kwargs)
+
+
 # ==========================================
 # 2. KONFIGURACJA STRONY STREAMLIT
 # ==========================================
 st.set_page_config(
-    page_title="RSP vs LCMS – Zaawansowana Analiza Kolein", layout="wide"
+    page_title="RSP vs LCMS – Szybka Analiza Kolein", layout="wide"
 )
-st.title("📐 System Analizy i Porównania RSP + LCMS (DSN 2019)")
+st.title("⚡ Szybki System Analizy RSP + LCMS (DSN 2019)")
 
 # ==========================================
-# 3. PANEL BOCZNY (INPUTY I KONTROLA)
+# 3. PANEL BOCZNY
 # ==========================================
 st.sidebar.header("1. Dane RSP (Profilograf)")
 uploaded_rsp = st.sidebar.file_uploader(
@@ -209,10 +250,6 @@ offset_pikitaz = st.sidebar.slider(
     max_value=200,
     value=0,
     step=1,
-    help=(
-        "Pozwala skorygować 150m obsuwę drogomierza i idealnie zsynchronizować"
-        " piki kolein na trasie."
-    ),
 )
 
 st.sidebar.header("4. Geometria belki RSP")
@@ -252,9 +289,7 @@ else:
 
 st.sidebar.header("5. Opcje Wykresu")
 test_stacjonarny = st.sidebar.checkbox(
-    "Tryb testu stacjonarnego (Łata 0)",
-    value=False,
-    help="Weryfikuje normę DSN 2019: odchyłka na łacie <= 0.5 mm.",
+    "Tryb testu stacjonarnego (Łata 0)", value=False
 )
 tryb_zero_l11 = st.sidebar.checkbox(
     "Ustaw L11 jako Zero (wysokość względna RSP)", value=True
@@ -265,18 +300,16 @@ wyrownaj_spadek_lcms = st.sidebar.checkbox(
 )
 pokaz_late_lcms = st.sidebar.checkbox("Pokaż łatę i koleiny LCMS", value=True)
 
-# Parsowanie plików dodatkowych
+# Parsowanie plików dodatkowych z pamięci podręcznej (RAM)
 lcms_profiles = None
 if uploaded_lcms is not None:
     try:
-        df_lcms_raw = (
-            pd.read_csv(uploaded_lcms, header=None, sep=None, engine="python")
-            if uploaded_lcms.name.endswith(".csv")
-            else pd.read_excel(uploaded_lcms, header=None)
-        )
-        lcms_profiles = parse_lcms_excel(df_lcms_raw)
+        with st.spinner("Przetwarzanie pliku LCMS (tylko pierwsze wczytanie)..."):
+            lcms_profiles = parse_lcms_excel_cached(
+                uploaded_lcms.getvalue(), uploaded_lcms.name
+            )
         st.sidebar.success(
-            f"Wczytano LCMS: {len(lcms_profiles)} połączonych profili."
+            f"Wczytano LCMS: {len(lcms_profiles)} profili."
         )
     except Exception as e:
         st.sidebar.error(f"Błąd odczytu LCMS: {e}")
@@ -293,12 +326,7 @@ if uploaded_xml is not None:
 # 4. GŁÓWNA LOGIKA ANALIZY I WYKRESÓW
 # ==========================================
 if uploaded_rsp is not None:
-    df_rsp = (
-        pd.read_csv(uploaded_rsp, sep=None, engine="python")
-        if uploaded_rsp.name.endswith(".csv")
-        else pd.read_excel(uploaded_rsp)
-    )
-    df_rsp.columns = df_rsp.columns.str.strip()
+    df_rsp = load_rsp_data(uploaded_rsp.getvalue(), uploaded_rsp.name)
 
     col_profil = "Profil" if "Profil" in df_rsp.columns else df_rsp.columns[0]
     min_p = int(df_rsp[col_profil].min())
@@ -380,7 +408,6 @@ if uploaded_rsp is not None:
                     " przekracza limit 0,5 mm dla łaty!"
                 )
 
-        # LCMS Data Processing
         kol_lcms_l, kol_lcms_p = None, None
         prof_lcms_data = None
         if lcms_profiles and wybrany_profil_lcms in lcms_profiles:
@@ -453,7 +480,6 @@ if uploaded_rsp is not None:
                 )
             )
 
-            # RSP Depth Vertical Lines
             x_kl, y_kl_prof, y_kl_lata = (
                 x_vals[idx_kol_l],
                 y_vals[idx_kol_l],
@@ -508,46 +534,28 @@ if uploaded_rsp is not None:
                 xanchor="left" if x_kp > 0 else "right",
             )
 
-        # LCMS Plot & Leveling & Hull Calculation
+        # LCMS Plot & Precyzyjne Prostowanie Na Bazie Otoczki Wypukłej
         if prof_lcms_data is not None:
             x_lcms = prof_lcms_data["x"]
             z_lcms_raw = prof_lcms_data["z"]
 
-            # Find crown in LCMS (highest point in central zone)
-            mid_mask_lcms = (x_lcms >= -0.5) & (x_lcms <= 0.5)
-            if np.any(mid_mask_lcms):
-                idx_crown_lcms = np.where(mid_mask_lcms)[0][
-                    np.argmax(z_lcms_raw[mid_mask_lcms])
-                ]
-            else:
-                idx_crown_lcms = len(x_lcms) // 2
-
             if wyrownaj_spadek_lcms:
-                # Detrend LCMS cross-slope by removing slope between left peak and right peak
-                left_mask = x_lcms <= x_lcms[idx_crown_lcms]
-                right_mask = x_lcms >= x_lcms[idx_crown_lcms]
+                hull_pts = get_upper_hull_pts(x_lcms, z_lcms_raw)
+                x_h = np.array([p[0] for p in hull_pts])
+                z_h = np.array([p[1] for p in hull_pts])
 
-                idx_peak_l = np.argmax(z_lcms_raw[left_mask])
-                idx_peak_r = (
-                    np.where(right_mask)[0][0]
-                    + np.argmax(z_lcms_raw[right_mask])
-                )
+                if len(x_h) >= 2:
+                    p_hull = np.polyfit(x_h, z_h, 1)
+                    slope_lcms = p_hull[0]
+                    z_lcms_leveled = z_lcms_raw - (slope_lcms * x_lcms)
+                else:
+                    z_lcms_leveled = z_lcms_raw
 
-                x_p1, z_p1 = x_lcms[idx_peak_l], z_lcms_raw[idx_peak_l]
-                x_p2, z_p2 = x_lcms[idx_peak_r], z_lcms_raw[idx_peak_r]
-
-                slope_lcms = (
-                    (z_p2 - z_p1) / (x_p2 - x_p1) if (x_p2 != x_p1) else 0.0
-                )
-                z_lcms_leveled = z_lcms_raw - (slope_lcms * x_lcms)
-
-                # Center relative to X=0
                 idx_mid_lcms = np.argmin(np.abs(x_lcms))
                 z_lcms_plot = z_lcms_leveled - z_lcms_leveled[idx_mid_lcms]
             else:
                 z_lcms_plot = z_lcms_raw
 
-            # Plot LCMS profile line
             fig.add_trace(
                 go.Scatter(
                     x=x_lcms,
@@ -558,7 +566,15 @@ if uploaded_rsp is not None:
                 )
             )
 
-            # LCMS Hull & Rut calculation
+            # Korona i Łata LCMS
+            mid_mask_lcms = (x_lcms >= -0.5) & (x_lcms <= 0.5)
+            if np.any(mid_mask_lcms):
+                idx_crown_lcms = np.where(mid_mask_lcms)[0][
+                    np.argmax(z_lcms_plot[mid_mask_lcms])
+                ]
+            else:
+                idx_crown_lcms = np.argmin(np.abs(x_lcms))
+
             x_lcms_l = x_lcms[: idx_crown_lcms + 1]
             z_lcms_l = z_lcms_plot[: idx_crown_lcms + 1]
             x_lcms_r = x_lcms[idx_crown_lcms:]
@@ -577,7 +593,6 @@ if uploaded_rsp is not None:
             calc_lcms_rut_r = diff_lcms_r[idx_kol_lcms_r_rel]
 
             if pokaz_late_lcms:
-                # LCMS Straightedge Lines
                 fig.add_trace(
                     go.Scatter(
                         x=x_lcms_l,
@@ -597,7 +612,6 @@ if uploaded_rsp is not None:
                     )
                 )
 
-                # LCMS Rut Vertical Depth Indicators
                 x_kl_c = x_lcms_l[idx_kol_lcms_l]
                 y_kl_c_prof = z_lcms_l[idx_kol_lcms_l]
                 y_kl_c_lata = lata_lcms_l_y[idx_kol_lcms_l]
@@ -676,10 +690,6 @@ if uploaded_rsp is not None:
         if lcms_profiles:
             st.markdown("---")
             st.subheader("📈 Przebieg Kolein na Całej Trasie (Wykres Podłużny)")
-            st.caption(
-                "Użyj suwaka w panelu bocznym ('Przesunięcie pikietażu'), aby"
-                " zsynchronizować zielone i niebieskie piki na poniższym wykresie."
-            )
 
             list_lcms_p = sorted(lcms_profiles.keys())
             lcms_rut_l = [lcms_profiles[p]["rut_l"] for p in list_lcms_p]
@@ -729,30 +739,65 @@ if uploaded_rsp is not None:
             idx_gps = min(max(0, wybrany_profil_lcms - 1), len(df_xml_gps) - 1)
             row_gps = df_xml_gps.iloc[idx_gps]
 
-            fig_map = px.scatter_mapbox(
-                df_xml_gps,
-                lat="LAT",
-                lon="LON",
-                hover_data=["Station_m", "Filename", "IDDROGI"],
-                zoom=14,
-                height=420,
-            )
+            fig_map = go.Figure()
+
+            # Trasa LCMS
             fig_map.add_trace(
-                go.Scattermapbox(
+                make_map_trace(
+                    lat=df_xml_gps["LAT"],
+                    lon=df_xml_gps["LON"],
+                    mode="markers+lines",
+                    marker=dict(size=6, color="royalblue"),
+                    line=dict(width=2, color="royalblue"),
+                    name="Trasa LCMS",
+                    text=[
+                        f"Pikietaż: {st_m:.1f}m<br>Plik: {fn}"
+                        for st_m, fn in zip(
+                            df_xml_gps["Station_m"], df_xml_gps["Filename"]
+                        )
+                    ],
+                )
+            )
+
+            # Czerwony punkt wybranego profilu
+            fig_map.add_trace(
+                make_map_trace(
                     lat=[row_gps["LAT"]],
                     lon=[row_gps["LON"]],
                     mode="markers",
                     marker=dict(size=14, color="red"),
                     name=f"Profil {wybrany_profil}",
+                    text=[
+                        f"Profil RSP {wybrany_profil}<br>Pikietaż LCMS:"
+                        f" {row_gps['Station_m']}m"
+                    ],
                 )
             )
-            fig_map.update_layout(
-                mapbox_style="open-street-map",
-                mapbox=dict(
-                    center=dict(lat=row_gps["LAT"], lon=row_gps["LON"])
-                ),
-                margin=dict(l=0, r=0, t=20, b=0),
+
+            map_config = dict(
+                center=dict(lat=row_gps["LAT"], lon=row_gps["LON"]), zoom=14
             )
+
+            try:
+                if hasattr(go, "Scattermap"):
+                    fig_map.update_layout(
+                        map_style="open-street-map",
+                        map=map_config,
+                        margin=dict(l=0, r=0, t=20, b=0),
+                        height=420,
+                    )
+                else:
+                    fig_map.update_layout(
+                        mapbox_style="open-street-map",
+                        mapbox=map_config,
+                        margin=dict(l=0, r=0, t=20, b=0),
+                        height=420,
+                    )
+            except Exception:
+                fig_map.update_layout(
+                    margin=dict(l=0, r=0, t=20, b=0), height=420
+                )
+
             st.plotly_chart(fig_map, use_container_width=True)
 
         st.subheader("Odczyty Czujników RSP [mm]:")
