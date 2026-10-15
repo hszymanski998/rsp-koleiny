@@ -150,6 +150,16 @@ def auto_align_transverse_x(x_rsp, y_rsp, x_lcms, z_lcms):
     return float(np.round(best_shift, 2))
 
 
+def get_total_offset_for_profil(
+    p, base_offset, split_sections, sec_size, sec_offsets, min_p
+):
+    """Dynamiczne pobieranie offsetu podłużnego dla dowolnego profilu na trasie."""
+    if not split_sections:
+        return base_offset
+    sec_idx = int((p - min_p) // sec_size)
+    return base_offset + sec_offsets.get(sec_idx, 0.0)
+
+
 # ==========================================
 # 3. PARSERY PLIKÓW RSP, LCMS, XML, GPX
 # ==========================================
@@ -419,6 +429,7 @@ def parse_single_lcms_raw(file_bytes, file_name):
             row_lh, row_ld = raw_rows[r_left_h], raw_rows[r_left_d]
             row_rh, row_rd = raw_rows[r_right_h], raw_rows[r_right_d]
 
+            st_val = safe_float(row_lh[0])
             rut_l = (
                 float(row_lh[1])
                 if len(row_lh) > 1 and row_lh[1] != ""
@@ -454,7 +465,7 @@ def parse_single_lcms_raw(file_bytes, file_name):
             sort_order = np.argsort(x_full)
 
             records.append({
-                "Station_m": None,
+                "Station_m": st_val,
                 "x": x_full[sort_order],
                 "z": z_full[sort_order],
                 "rut_l": rut_l,
@@ -477,43 +488,22 @@ def load_multiple_lcms_files(uploaded_files_list):
     if not all_records:
         return {}
 
-    has_station = any(r["Station_m"] is not None for r in all_records)
     profiles = {}
+    for idx, r in enumerate(all_records):
+        st_m = r["Station_m"]
+        pid = int(round(st_m)) if st_m is not None else idx + 1
 
-    if has_station:
-        all_records = sorted(
-            all_records,
-            key=lambda r: (
-                r["Station_m"] if r["Station_m"] is not None else 0.0
-            ),
-        )
-        min_st = min(
-            r["Station_m"] for r in all_records if r["Station_m"] is not None
-        )
-        for r in all_records:
-            st_m = r["Station_m"]
-            pid = (
-                int(round(st_m - min_st)) + 1
-                if st_m is not None
-                else len(profiles) + 1
-            )
-            profiles[pid] = {
-                "x": r["x"],
-                "z": r["z"],
-                "rut_l": r["rut_l"],
-                "rut_r": r["rut_r"],
-                "Station_m": st_m,
-            }
-    else:
-        for idx, r in enumerate(all_records):
-            pid = idx + 1
-            profiles[pid] = {
-                "x": r["x"],
-                "z": r["z"],
-                "rut_l": r["rut_l"],
-                "rut_r": r["rut_r"],
-                "Station_m": None,
-            }
+        # Zapobieganie nadpisywaniu przy nakładających się indeksach w osobnych plikach
+        while pid in profiles and r["Station_m"] is None:
+            pid += 1
+
+        profiles[pid] = {
+            "x": r["x"],
+            "z": r["z"],
+            "rut_l": r["rut_l"],
+            "rut_r": r["rut_r"],
+            "Station_m": st_m,
+        }
 
     return profiles
 
@@ -759,32 +749,40 @@ def compute_50m_dsn_sections_full(df_ruts, step_m=1.0, section_m=50.0):
             "RSP MAX_KOL Klasa": get_dsn_class(hm_m),
         }
 
-        if "LCMS_Rut_L" in sub.columns:
-            lcms_l, lcms_r = sub["LCMS_Rut_L"].values, sub["LCMS_Rut_R"].values
-            lcms_max = np.maximum(lcms_l, lcms_r)
-            e_ll, d_ll = np.mean(lcms_l), np.std(lcms_l, ddof=0)
-            e_rr, d_rr = np.mean(lcms_r), np.std(lcms_r, ddof=0)
-            e_mm, d_mm = np.mean(lcms_max), np.std(lcms_max, ddof=0)
-            hm_ll, hm_rr, hm_mm = (
-                int(np.round(e_ll + 2 * d_ll)),
-                int(np.round(e_rr + 2 * d_rr)),
-                int(np.round(e_mm + 2 * d_mm)),
-            )
+        if (
+            "LCMS_Rut_L" in sub.columns
+            and not sub["LCMS_Rut_L"].dropna().empty
+        ):
+            sub_lcms = sub.dropna(subset=["LCMS_Rut_L", "LCMS_Rut_R"])
+            if len(sub_lcms) > 0:
+                lcms_l, lcms_r = (
+                    sub_lcms["LCMS_Rut_L"].values,
+                    sub_lcms["LCMS_Rut_R"].values,
+                )
+                lcms_max = np.maximum(lcms_l, lcms_r)
+                e_ll, d_ll = np.mean(lcms_l), np.std(lcms_l, ddof=0)
+                e_rr, d_rr = np.mean(lcms_r), np.std(lcms_r, ddof=0)
+                e_mm, d_mm = np.mean(lcms_max), np.std(lcms_max, ddof=0)
+                hm_ll, hm_rr, hm_mm = (
+                    int(np.round(e_ll + 2 * d_ll)),
+                    int(np.round(e_rr + 2 * d_rr)),
+                    int(np.round(e_mm + 2 * d_mm)),
+                )
 
-            rec.update({
-                "LCMS L_KOL E(h)": round(e_ll, 2),
-                "LCMS L_KOL Dh": round(d_ll, 2),
-                "LCMS L_KOL Hm": hm_ll,
-                "LCMS L_KOL Klasa": get_dsn_class(hm_ll),
-                "LCMS P_KOL E(h)": round(e_rr, 2),
-                "LCMS P_KOL Dh": round(d_rr, 2),
-                "LCMS P_KOL Hm": hm_rr,
-                "LCMS P_KOL Klasa": get_dsn_class(hm_rr),
-                "LCMS MAX_KOL E(h)": round(e_mm, 2),
-                "LCMS MAX_KOL Dh": round(d_mm, 2),
-                "LCMS MAX_KOL Hm": hm_mm,
-                "LCMS MAX_KOL Klasa": get_dsn_class(hm_mm),
-            })
+                rec.update({
+                    "LCMS L_KOL E(h)": round(e_ll, 2),
+                    "LCMS L_KOL Dh": round(d_ll, 2),
+                    "LCMS L_KOL Hm": hm_ll,
+                    "LCMS L_KOL Klasa": get_dsn_class(hm_ll),
+                    "LCMS P_KOL E(h)": round(e_rr, 2),
+                    "LCMS P_KOL Dh": round(d_rr, 2),
+                    "LCMS P_KOL Hm": hm_rr,
+                    "LCMS P_KOL Klasa": get_dsn_class(hm_rr),
+                    "LCMS MAX_KOL E(h)": round(e_mm, 2),
+                    "LCMS MAX_KOL Dh": round(d_mm, 2),
+                    "LCMS MAX_KOL Hm": hm_mm,
+                    "LCMS MAX_KOL Klasa": get_dsn_class(hm_mm),
+                })
 
         results.append(rec)
 
@@ -927,7 +925,7 @@ if bytes_rsp is not None and (
 
 st.sidebar.header("3. Synchronizacja Podłużna (Pikietaż)")
 glowny_offset = st.sidebar.number_input(
-    "✍️ Przesunięcie podłużne LCMS względem RSP [m]:",
+    "✍️ Bazowe przesunięcie LCMS względem RSP [m]:",
     min_value=-500.0,
     max_value=500.0,
     value=st.session_state["glowny_offset_val"],
@@ -1055,17 +1053,20 @@ if bytes_rsp is not None:
     min_p, max_p = int(df_rsp[col_profil].min()), int(df_rsp[col_profil].max())
 
     if podziel_na_sekcje:
-        num_sekcji = int(np.ceil((max_p - min_p + 1) / sekcja_m))
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("📍 Przesunięcia Sekcyjne")
+        num_sekcji = int(np.ceil((max_p - min_p + 1) / float(sekcja_m)))
         for s_i in range(num_sekcji):
             p_start_s = min_p + s_i * sekcja_m
             p_end_s = min(max_p, p_start_s + sekcja_m - 1)
             sekcje_offsets[s_i] = st.sidebar.number_input(
                 f"Sekcja {s_i+1} ({p_start_s}-{p_end_s}m) [m]:",
-                min_value=-100.0,
-                max_value=100.0,
+                min_value=-200.0,
+                max_value=200.0,
                 value=0.0,
-                step=0.1,
+                step=0.5,
                 format="%.1f",
+                key=f"sec_off_input_{s_i}",
             )
 
     st.sidebar.header("7. Wybór profilu")
@@ -1078,12 +1079,14 @@ if bytes_rsp is not None:
     )
 
     bazowy_offset = st.session_state["glowny_offset_val"]
-    dodatkowy_s_offset = (
-        sekcje_offsets.get(int((wybrany_profil - min_p) // sekcja_m), 0.0)
-        if podziel_na_sekcje
-        else 0.0
+    całkowity_offset = get_total_offset_for_profil(
+        wybrany_profil,
+        bazowy_offset,
+        podziel_na_sekcje,
+        sekcja_m,
+        sekcje_offsets,
+        min_p,
     )
-    całkowity_offset = bazowy_offset + dodatkowy_s_offset
     wybrany_profil_lcms = int(round(wybrany_profil + całkowity_offset))
 
     if lcms_profiles:
@@ -1216,7 +1219,7 @@ if bytes_rsp is not None:
             z_ref_lcms = z_lcms_leveled[idx_mid_lcms]
             z_lcms_plot = z_lcms_leveled - z_ref_lcms
 
-            # Obliczenie wirtualnej łaty dla LCMS na docelowych współrzędnych
+            # Obliczenie wirtualnej łaty dla LCMS
             mid_mask_lcms = (x_lcms >= -0.5) & (x_lcms <= 0.5)
             if np.any(mid_mask_lcms):
                 idx_c_lcms = np.where(mid_mask_lcms)[0][
@@ -1328,7 +1331,7 @@ if bytes_rsp is not None:
             # WYKRES POPRZECZNY Z PRZESUNIĘCIEM X I OBU WIRTUALNYMI ŁATAMI
             fig = go.Figure()
 
-            # 1. Profil RSP
+            # Profil RSP
             fig.add_trace(
                 go.Scatter(
                     x=x_vals,
@@ -1345,7 +1348,7 @@ if bytes_rsp is not None:
                 )
             )
 
-            # 2. Wirtualna łata RSP
+            # Wirtualna łata RSP
             if pokaz_late_rsp:
                 fig.add_trace(
                     go.Scatter(
@@ -1432,7 +1435,7 @@ if bytes_rsp is not None:
                     ay=-30,
                 )
 
-            # 3. Profil LCMS oraz Wirtualna Łata LCMS
+            # Profil LCMS oraz Wirtualna Łata LCMS
             if prof_lcms_data is not None:
                 fig.add_trace(
                     go.Scatter(
@@ -1451,7 +1454,9 @@ if bytes_rsp is not None:
                             y=lata_lcms_l,
                             mode="lines",
                             name="Łata LCMS Lewa",
-                            line=dict(color="mediumseagreen", width=2, dash="dash"),
+                            line=dict(
+                                color="mediumseagreen", width=2, dash="dash"
+                            ),
                         )
                     )
                     fig.add_trace(
@@ -1464,7 +1469,6 @@ if bytes_rsp is not None:
                         )
                     )
 
-                    # Odcinek maksymalnego zagłębienia LCMS Lewa
                     x_lcms_kl = x_lcms_l[idx_max_lcms_l]
                     z_lcms_kl_prof = z_lcms_l[idx_max_lcms_l]
                     z_lcms_kl_lata = lata_lcms_l[idx_max_lcms_l]
@@ -1496,7 +1500,6 @@ if bytes_rsp is not None:
                         ay=35,
                     )
 
-                    # Odcinek maksymalnego zagłębienia LCMS Prawa
                     x_lcms_kp = x_lcms_r[idx_max_lcms_r]
                     z_lcms_kp_prof = z_lcms_r[idx_max_lcms_r]
                     z_lcms_kp_lata = lata_lcms_r[idx_max_lcms_r]
@@ -1545,7 +1548,7 @@ if bytes_rsp is not None:
             )
             st.plotly_chart(fig, width="stretch", key="fig_cross_section")
 
-            # WYKRES PODŁUŻNY Z LINIĄ AKTUALNEGO PROFILU
+            # WYKRES PODŁUŻNY Z DYNAMICZNYM SEKCJA-PO-SEKCJI DOPASOWANIEM
             st.markdown("---")
             st.subheader("📈 PRZEBIEG KOLEIN NA CAŁEJ TRASIE")
             df_all_rsp_ruts = compute_all_rsp_ruts_cached(
@@ -1553,14 +1556,24 @@ if bytes_rsp is not None:
             )
 
             if lcms_profiles:
-                list_lcms_p = sorted(lcms_profiles.keys())
-                lcms_file_rut_l = [
-                    lcms_profiles[p]["rut_l"] for p in list_lcms_p
-                ]
-                lcms_file_rut_r = [
-                    lcms_profiles[p]["rut_r"] for p in list_lcms_p
-                ]
-                lcms_p_shifted = [p - całkowity_offset for p in list_lcms_p]
+                lcms_aligned_max = []
+                for p_rsp in df_all_rsp_ruts["Profil"]:
+                    off_p = get_total_offset_for_profil(
+                        p_rsp,
+                        bazowy_offset,
+                        podziel_na_sekcje,
+                        sekcja_m,
+                        sekcje_offsets,
+                        min_p,
+                    )
+                    target_lcms_p = int(round(p_rsp + off_p))
+                    if target_lcms_p in lcms_profiles:
+                        p_data = lcms_profiles[target_lcms_p]
+                        lcms_aligned_max.append(
+                            max(p_data["rut_l"], p_data["rut_r"])
+                        )
+                    else:
+                        lcms_aligned_max.append(np.nan)
 
                 fig_m = go.Figure()
                 fig_m.add_trace(
@@ -1574,10 +1587,10 @@ if bytes_rsp is not None:
                 )
                 fig_m.add_trace(
                     go.Scatter(
-                        x=lcms_p_shifted,
-                        y=np.maximum(lcms_file_rut_l, lcms_file_rut_r),
+                        x=df_all_rsp_ruts["Profil"],
+                        y=lcms_aligned_max,
                         mode="lines",
-                        name="LCMS Max",
+                        name="LCMS Max (Dopasowane)",
                         line=dict(color="forestgreen", width=2),
                     )
                 )
@@ -1588,7 +1601,10 @@ if bytes_rsp is not None:
                     annotation_text=f"Profil RSP {wybrany_profil}",
                 )
                 fig_m.update_layout(
-                    title="Maksymalna Koleina na Całej Trasie [mm]",
+                    title=(
+                        "Maksymalna Koleina na Całej Trasie [mm] (Dopasowanie"
+                        " Sekcyjne)"
+                    ),
                     xaxis_title="Numer Profilu RSP",
                     yaxis_title="Koleina [mm]",
                     height=400,
@@ -1641,24 +1657,35 @@ if bytes_rsp is not None:
                     " wyświetlić interaktywną mapę."
                 )
 
-        # TAB 3: OCENA 50M DSN 2019
+        # TAB 3: OCENA 50M DSN 2019 DLA CAŁEJ TRASY
         with tab_dsn50:
             st.header("📊 Ocena Odcinków 50m wg Normy DSN 2019")
             df_merged_ruts = df_all_rsp_ruts.copy()
             if lcms_profiles:
-                list_lcms_p = sorted(lcms_profiles.keys())
-                df_lcms_sub = pd.DataFrame({
-                    "Profil": [int(p - całkowity_offset) for p in list_lcms_p],
-                    "LCMS_Rut_L": [
-                        lcms_profiles[p]["rut_l"] for p in list_lcms_p
-                    ],
-                    "LCMS_Rut_R": [
-                        lcms_profiles[p]["rut_r"] for p in list_lcms_p
-                    ],
-                })
-                df_merged_ruts = pd.merge(
-                    df_merged_ruts, df_lcms_sub, on="Profil", how="inner"
-                )
+                lcms_l_vals, lcms_r_vals = [], []
+                for p_rsp in df_merged_ruts["Profil"]:
+                    off_p = get_total_offset_for_profil(
+                        p_rsp,
+                        bazowy_offset,
+                        podziel_na_sekcje,
+                        sekcja_m,
+                        sekcje_offsets,
+                        min_p,
+                    )
+                    target_lcms_p = int(round(p_rsp + off_p))
+                    if target_lcms_p in lcms_profiles:
+                        lcms_l_vals.append(
+                            lcms_profiles[target_lcms_p]["rut_l"]
+                        )
+                        lcms_r_vals.append(
+                            lcms_profiles[target_lcms_p]["rut_r"]
+                        )
+                    else:
+                        lcms_l_vals.append(np.nan)
+                        lcms_r_vals.append(np.nan)
+
+                df_merged_ruts["LCMS_Rut_L"] = lcms_l_vals
+                df_merged_ruts["LCMS_Rut_R"] = lcms_r_vals
 
             df_sec_dsn = compute_50m_dsn_sections_full(
                 df_merged_ruts, step_m=1.0, section_m=50.0
@@ -1673,41 +1700,54 @@ if bytes_rsp is not None:
             )
             st.dataframe(sanitize_df(df_sec_dsn), width="stretch")
 
-        # TAB 4: BLAND-ALTMAN & RPD GDDKiA
+        # TAB 4: BLAND-ALTMAN & RPD GDDKiA DLA CAŁEJ TRASY
         with tab_ba_gddkia:
             st.header("📈 Analiza Statystyczna Blanda-Altmana i RPD")
             if lcms_profiles and "LCMS_Rut_L" in df_merged_ruts.columns:
-                col_ba1, col_ba2 = st.columns(2)
+                df_valid_ba = df_merged_ruts.dropna(
+                    subset=["LCMS_Rut_L", "LCMS_Rut_R"]
+                )
+                if not df_valid_ba.empty:
+                    col_ba1, col_ba2 = st.columns(2)
 
-                with col_ba1:
-                    rsp_r_v, lcms_r_v = (
-                        df_merged_ruts["RSP_Rut_R"].values,
-                        df_merged_ruts["LCMS_Rut_R"].values,
-                    )
-                    fig_ba_r, mean_r, sd_r, loa_u_r, loa_l_r = (
-                        build_bland_altman_fig(
-                            rsp_r_v, lcms_r_v, title="PRAWA KOLEINA (P_KOL)"
+                    with col_ba1:
+                        rsp_r_v, lcms_r_v = (
+                            df_valid_ba["RSP_Rut_R"].values,
+                            df_valid_ba["LCMS_Rut_R"].values,
                         )
-                    )
-                    st.plotly_chart(
-                        fig_ba_r, width="stretch", key="ba_prawa_chart"
-                    )
-                    st.table(sanitize_df(build_rpd_table_df(rsp_r_v, lcms_r_v)))
+                        fig_ba_r, mean_r, sd_r, loa_u_r, loa_l_r = (
+                            build_bland_altman_fig(
+                                rsp_r_v, lcms_r_v, title="PRAWA KOLEINA (P_KOL)"
+                            )
+                        )
+                        st.plotly_chart(
+                            fig_ba_r, width="stretch", key="ba_prawa_chart"
+                        )
+                        st.table(
+                            sanitize_df(build_rpd_table_df(rsp_r_v, lcms_r_v))
+                        )
 
-                with col_ba2:
-                    rsp_l_v, lcms_l_v = (
-                        df_merged_ruts["RSP_Rut_L"].values,
-                        df_merged_ruts["LCMS_Rut_L"].values,
-                    )
-                    fig_ba_l, mean_l, sd_l, loa_u_l, loa_l_l = (
-                        build_bland_altman_fig(
-                            rsp_l_v, lcms_l_v, title="LEWA KOLEINA (L_KOL)"
+                    with col_ba2:
+                        rsp_l_v, lcms_l_v = (
+                            df_valid_ba["RSP_Rut_L"].values,
+                            df_valid_ba["LCMS_Rut_L"].values,
                         )
+                        fig_ba_l, mean_l, sd_l, loa_u_l, loa_l_l = (
+                            build_bland_altman_fig(
+                                rsp_l_v, lcms_l_v, title="LEWA KOLEINA (L_KOL)"
+                            )
+                        )
+                        st.plotly_chart(
+                            fig_ba_l, width="stretch", key="ba_lewa_chart"
+                        )
+                        st.table(
+                            sanitize_df(build_rpd_table_df(rsp_l_v, lcms_l_v))
+                        )
+                else:
+                    st.warning(
+                        "⚠️ Brak dopasowanych profili LCMS dla wskazanych"
+                        " przesunięć."
                     )
-                    st.plotly_chart(
-                        fig_ba_l, width="stretch", key="ba_lewa_chart"
-                    )
-                    st.table(sanitize_df(build_rpd_table_df(rsp_l_v, lcms_l_v)))
             else:
                 st.warning("⚠️ Brak powiązanych danych LCMS do analizy.")
 
