@@ -124,6 +124,30 @@ def get_upper_hull(x_sec, y_sec):
     return np.interp(x_sec, x_h, y_h)
 
 
+def auto_align_transverse_x(x_rsp, y_rsp, x_lcms, z_lcms):
+    """Wylicza optymalne przesunięcie X, aby idealnie nałożyć profil LCMS na RSP."""
+    x_grid = np.linspace(-1.5, 1.5, 300)
+    y_rsp_interp = np.interp(x_grid, x_rsp, y_rsp, left=np.nan, right=np.nan)
+
+    best_shift = 0.0
+    min_err = 1e9
+
+    for shift in np.arange(-1.0, 1.05, 0.01):
+        z_lcms_interp = np.interp(
+            x_grid, x_lcms + shift, z_lcms, left=np.nan, right=np.nan
+        )
+        valid = ~np.isnan(y_rsp_interp) & ~np.isnan(z_lcms_interp)
+        if np.sum(valid) > 50:
+            diff = (y_rsp_interp[valid] - np.mean(y_rsp_interp[valid])) - (
+                z_lcms_interp[valid] - np.mean(z_lcms_interp[valid])
+            )
+            err = np.mean(diff**2)
+            if err < min_err:
+                min_err = err
+                best_shift = shift
+    return float(np.round(best_shift, 2))
+
+
 # ==========================================
 # 3. PARSERY PLIKÓW RSP, LCMS, XML, GPX
 # ==========================================
@@ -844,8 +868,13 @@ def make_50m_bar_chart(
 
 
 # ==========================================
-# 5. PANEL BOCZNY (SIDEBAR)
+# 5. INICJALIZACJA SESSION STATE & PANEL
 # ==========================================
+if "glowny_offset_val" not in st.session_state:
+    st.session_state["glowny_offset_val"] = 0.0
+if "manual_x_shift_val" not in st.session_state:
+    st.session_state["manual_x_shift_val"] = 0.0
+
 st.title("⚡ System Analizy RSP + LCMS (DSN 2019 & GDDKiA)")
 
 st.sidebar.header("1. Dane RSP (Profilograf / Surowe)")
@@ -894,15 +923,17 @@ if bytes_rsp is not None and (
 ):
     _, _, auto_x_from_rsp = parse_native_rsp_file(bytes_rsp)
 
-st.sidebar.header("3. Synchronizacja i Pikietaż")
+st.sidebar.header("3. Synchronizacja Podłużna (Pikietaż)")
 glowny_offset = st.sidebar.number_input(
-    "✍️ Przesunięcie pikietażu LCMS względem RSP [m]:",
+    "✍️ Przesunięcie podłużne LCMS względem RSP [m]:",
     min_value=-500.0,
     max_value=500.0,
-    value=0.0,
+    value=st.session_state["glowny_offset_val"],
     step=1.0,
     format="%.1f",
+    key="offset_input_widget",
 )
+st.session_state["glowny_offset_val"] = glowny_offset
 
 podziel_na_sekcje = st.sidebar.checkbox(
     "Dziel trasę na sekcje (osobne przesunięcia)", value=False
@@ -952,22 +983,31 @@ zrodlo_lcms = st.sidebar.radio(
     ["Z pliku LCMS (surowe B2/C2)", "Wyliczone z profilu (Wirtualna Łata)"],
 )
 
-st.sidebar.header("6. Dopasowanie Poprzeczne")
-zaczep_prawa_krawedz = st.sidebar.checkbox(
-    "🔗 Zaczep prawą krawędź LCMS do RSP", value=True
+st.sidebar.header("6. Dopasowanie Poprzeczne X (Lewo/Prawo)")
+tryb_dopasowania_x = st.sidebar.radio(
+    "Tryb bazowy dla X:",
+    [
+        "Swobodne przesunięcie (suwak)",
+        "Zaczep do prawej krawędzi RSP",
+        "Wyśrodkuj osie (Zero w środku)",
+    ],
+    index=0,
 )
+
+manual_x_shift_lcms = st.sidebar.slider(
+    "↔️ Przesunięcie poprzeczne X LCMS [m]:",
+    min_value=-2.00,
+    max_value=2.00,
+    value=st.session_state["manual_x_shift_val"],
+    step=0.01,
+    format="%.2f",
+    key="manual_x_slider_widget",
+)
+st.session_state["manual_x_shift_val"] = manual_x_shift_lcms
+
 skaluj_szerokosc = st.sidebar.checkbox(
     "📐 Skaluj szerokość LCMS do RSP", value=False
 )
-manual_x_shift_lcms = st.sidebar.number_input(
-    "Ręczne przesunięcie X LCMS [m]:",
-    min_value=-2.0,
-    max_value=2.0,
-    value=0.0,
-    step=0.01,
-    format="%.2f",
-)
-
 tryb_zero_l11 = st.sidebar.checkbox("Ustaw L11 jako Zero", value=True)
 pokaz_late_rsp = st.sidebar.checkbox("Pokaż łatę i koleiny RSP", value=True)
 wyrownaj_spadek_lcms = st.sidebar.checkbox(
@@ -1001,7 +1041,7 @@ df_xml_gps = (
     else None
 )
 if df_xml_gps is not None:
-    st.sidebar.success(f"GPS LCMS: {len(df_xml_gps)} pkt z XML!")
+    st.sidebar.success(f"GPS LCMS: Łącznie {len(df_xml_gps)} pkt z XML!")
 
 
 # ==========================================
@@ -1035,7 +1075,7 @@ if bytes_rsp is not None:
         step=1,
     )
 
-    bazowy_offset = glowny_offset
+    bazowy_offset = st.session_state["glowny_offset_val"]
     dodatkowy_s_offset = (
         sekcje_offsets.get(int((wybrany_profil - min_p) // sekcja_m), 0.0)
         if podziel_na_sekcje
@@ -1053,10 +1093,14 @@ if bytes_rsp is not None:
         )
 
         if st.sidebar.button("⚡ Automatyczna Synchronizacja Pikietażu"):
-            sug_offset = auto_align_offset_clean(
-                df_all_rsp_ruts["RSP_Rut_Max"].values, lcms_file_rut_max
+            sug_offset = float(
+                auto_align_offset_clean(
+                    df_all_rsp_ruts["RSP_Rut_Max"].values, lcms_file_rut_max
+                )
             )
-            st.sidebar.info(f"💡 Sugerowany offset: {sug_offset:+} m")
+            st.session_state["glowny_offset_val"] = sug_offset
+            st.sidebar.info(f"💡 Ustawiono sugerowany offset: {sug_offset:+} m")
+            st.rerun()
 
     tab_main, tab_map, tab_dsn50, tab_ba_gddkia, tab_export = st.tabs([
         "📐 Przekrój Poprzeczny & Trasa",
@@ -1166,28 +1210,39 @@ if bytes_rsp is not None:
                 )
             )
 
+            if st.sidebar.button("⚡ Dopasuj poprzecznie (X) LCMS do RSP"):
+                best_x_shift = auto_align_transverse_x(
+                    np.array(x_vals), y_vals, x_lcms_orig, z_lcms_smooth
+                )
+                st.session_state["manual_x_shift_val"] = best_x_shift
+                st.sidebar.info(
+                    f"💡 Ustawiono przesunięcie X: {best_x_shift:+.2f} m"
+                )
+                st.rerun()
+
         # TAB 1: PRZEKRÓJ POPRZECZNY I TRASA
         with tab_main:
             st.subheader(
-                f"Profil RSP nr {wybrany_profil} (LCMS nr"
-                f" {wybrany_profil_lcms}, przesunięcie:"
-                f" {całkowity_offset:+.1f} m)"
+                f"Profil RSP nr {wybrany_profil} (Dopasowany LCMS nr"
+                f" {wybrany_profil_lcms}, Offset Podłużny: {całkowity_offset:+.1f}"
+                f" m, Poprzeczny X: {manual_x_shift_lcms:+.2f} m)"
             )
+
             rc1, rc2, rc3 = st.columns(3)
             rc1.metric(
                 "RSP Koleina Lewa",
-                f"{koleina_lewa_mm:.1f} mm (Klasa"
-                f" {get_dsn_class(koleina_lewa_mm)})",
+                f"{koleina_lewa_mm:.1f} mm",
+                f"Klasa {get_dsn_class(koleina_lewa_mm)}",
             )
             rc2.metric(
                 "RSP Koleina Prawa",
-                f"{koleina_prawa_mm:.1f} mm (Klasa"
-                f" {get_dsn_class(koleina_prawa_mm)})",
+                f"{koleina_prawa_mm:.1f} mm",
+                f"Klasa {get_dsn_class(koleina_prawa_mm)}",
             )
             rc3.metric(
                 "RSP Koleina Max",
-                f"{max_koleina_rsp:.1f} mm (Klasa"
-                f" {get_dsn_class(max_koleina_rsp)})",
+                f"{max_koleina_rsp:.1f} mm",
+                f"Klasa {get_dsn_class(max_koleina_rsp)}",
             )
 
             lc1, lc2, lc3 = st.columns(3)
@@ -1204,12 +1259,12 @@ if bytes_rsp is not None:
                 )
                 lc1.metric(
                     "LCMS Koleina Lewa",
-                    f"{disp_l:.1f} mm (Klasa {get_dsn_class(disp_l)})",
+                    f"{disp_l:.1f} mm",
                     delta=f"{koleina_lewa_mm - disp_l:+.1f} mm vs RSP",
                 )
                 lc2.metric(
                     "LCMS Koleina Prawa",
-                    f"{disp_p:.1f} mm (Klasa {get_dsn_class(disp_p)})",
+                    f"{disp_p:.1f} mm",
                     delta=f"{koleina_prawa_mm - disp_p:+.1f} mm vs RSP",
                 )
                 lc3.metric(
@@ -1218,9 +1273,11 @@ if bytes_rsp is not None:
                     delta=f"{max_koleina_rsp - max(disp_l, disp_p):+.1f} mm vs RSP",
                 )
             else:
-                lc1.info("Brak profilu LCMS dla wybranego pikietażu.")
+                lc1.info(
+                    "Brak dopasowanego profilu LCMS dla obecnego pikietażu."
+                )
 
-            # WYKRES POPRZECZNY
+            # WYKRES POPRZECZNY Z PRZESUNIĘCIEM X
             fig = go.Figure()
             fig.add_trace(
                 go.Scatter(
@@ -1270,7 +1327,25 @@ if bytes_rsp is not None:
                         mode="lines+markers",
                         name=f"RSP Lewa ({koleina_lewa_mm:.1f} mm)",
                         line=dict(color="crimson", width=3),
+                        marker=dict(size=6, symbol="triangle-down"),
                     )
+                )
+                fig.add_annotation(
+                    x=x_kl,
+                    y=(y_kl_lata + y_kl_prof) / 2,
+                    text=(
+                        f"<b>RSP Lewa: {koleina_lewa_mm:.1f} mm</b><br>Klasa"
+                        f" {get_dsn_class(koleina_lewa_mm)}"
+                    ),
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowcolor="crimson",
+                    font=dict(color="crimson", size=11),
+                    bgcolor="rgba(255, 255, 255, 0.9)",
+                    bordercolor="crimson",
+                    borderwidth=1,
+                    ax=-60,
+                    ay=-30,
                 )
 
                 x_kp, y_kp_prof, y_kp_lata = (
@@ -1285,7 +1360,25 @@ if bytes_rsp is not None:
                         mode="lines+markers",
                         name=f"RSP Prawa ({koleina_prawa_mm:.1f} mm)",
                         line=dict(color="darkorange", width=3),
+                        marker=dict(size=6, symbol="triangle-down"),
                     )
+                )
+                fig.add_annotation(
+                    x=x_kp,
+                    y=(y_kp_prof + y_kp_lata) / 2,
+                    text=(
+                        f"<b>RSP Prawa: {koleina_prawa_mm:.1f} mm</b><br>Klasa"
+                        f" {get_dsn_class(koleina_prawa_mm)}"
+                    ),
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowcolor="darkorange",
+                    font=dict(color="darkorange", size=11),
+                    bgcolor="rgba(255, 255, 255, 0.9)",
+                    bordercolor="darkorange",
+                    borderwidth=1,
+                    ax=60,
+                    ay=-30,
                 )
 
             if prof_lcms_data is not None:
@@ -1296,24 +1389,26 @@ if bytes_rsp is not None:
                 rsp_x_max, rsp_x_min = np.max(x_vals), np.min(x_vals)
                 x_lcms = x_lcms_orig.copy()
 
+                if (
+                    tryb_dopasowania_x == "Zaczep do prawej krawędzi RSP"
+                    and len(x_lcms) > 0
+                ):
+                    x_lcms = x_lcms + (rsp_x_max - np.max(x_lcms))
+                elif (
+                    tryb_dopasowania_x == "Wyśrodkuj osie (Zero w środku)"
+                    and len(x_lcms) > 0
+                ):
+                    lcms_mid = (np.min(x_lcms) + np.max(x_lcms)) / 2.0
+                    x_lcms = x_lcms - lcms_mid
+
                 if skaluj_szerokosc and len(x_lcms) > 1:
                     lcms_min, lcms_max = np.min(x_lcms), np.max(x_lcms)
                     x_lcms = rsp_x_min + (x_lcms - lcms_min) * (
                         (rsp_x_max - rsp_x_min) / (lcms_max - lcms_min)
                     )
-                elif zaczep_prawa_krawedz and len(x_lcms) > 0:
-                    x_lcms = x_lcms + (rsp_x_max - np.max(x_lcms))
 
+                # Kluczowe: Przesunięcie X z suwaka!
                 x_lcms = x_lcms + manual_x_shift_lcms
-
-                mid_mask_raw = (x_lcms >= -0.5) & (x_lcms <= 0.5)
-                idx_crown_lcms = (
-                    np.where(mid_mask_raw)[0][
-                        np.argmax(z_lcms_smooth[mid_mask_raw])
-                    ]
-                    if np.any(mid_mask_raw)
-                    else np.argmin(np.abs(x_lcms))
-                )
 
                 if wyrownaj_spadek_lcms and len(x_lcms) > 10:
                     p_trend = np.polyfit(x_lcms, z_lcms_smooth, 1)
@@ -1335,18 +1430,52 @@ if bytes_rsp is not None:
                     )
                 )
 
-            fig.add_vline(x=0, line_width=1, line_dash="dot", line_color="gray")
+                if kol_lcms_l is not None and kol_lcms_p is not None:
+                    fig.add_annotation(
+                        x=-0.8 + manual_x_shift_lcms,
+                        y=np.max(z_lcms_plot),
+                        text=(
+                            f"<b>LCMS L: {disp_l:.1f} mm</b> (Δ"
+                            f" {koleina_lewa_mm - disp_l:+.1f} mm)"
+                        ),
+                        showarrow=False,
+                        font=dict(color="forestgreen", size=11),
+                        bgcolor="rgba(235, 255, 235, 0.95)",
+                        bordercolor="forestgreen",
+                        borderwidth=1,
+                    )
+                    fig.add_annotation(
+                        x=0.8 + manual_x_shift_lcms,
+                        y=np.max(z_lcms_plot),
+                        text=(
+                            f"<b>LCMS P: {disp_p:.1f} mm</b> (Δ"
+                            f" {koleina_prawa_mm - disp_p:+.1f} mm)"
+                        ),
+                        showarrow=False,
+                        font=dict(color="forestgreen", size=11),
+                        bgcolor="rgba(235, 255, 235, 0.95)",
+                        bordercolor="forestgreen",
+                        borderwidth=1,
+                    )
+
+            fig.add_vline(
+                x=0,
+                line_width=1,
+                line_dash="dot",
+                line_color="gray",
+                annotation_text="Oś L11 (0.0 m)",
+            )
             fig.update_layout(
                 title=f"Przekrój Poprzeczny – Profil RSP nr {wybrany_profil}",
                 xaxis_title="Pozycja czujnika na belce [m]",
                 yaxis_title=y_label,
                 height=550,
-                xaxis=dict(range=[-1.85, 1.85], dtick=0.2),
+                xaxis=dict(range=[-2.2, 2.2], dtick=0.2),
                 yaxis=dict(autorange=True if tryb_zero_l11 else "reversed"),
             )
             st.plotly_chart(fig, width="stretch", key="fig_cross_section")
 
-            # WYKRES PODŁUŻNY
+            # WYKRES PODŁUŻNY Z LINIĄ AKTUALNEGO PROFILU
             st.markdown("---")
             st.subheader("📈 PRZEBIEG KOLEIN NA CAŁEJ TRASIE")
             df_all_rsp_ruts = compute_all_rsp_ruts_cached(
@@ -1382,7 +1511,12 @@ if bytes_rsp is not None:
                         line=dict(color="forestgreen", width=2),
                     )
                 )
-                fig_m.add_vline(x=wybrany_profil, line_width=2, line_color="red")
+                fig_m.add_vline(
+                    x=wybrany_profil,
+                    line_width=2,
+                    line_color="red",
+                    annotation_text=f"Profil RSP {wybrany_profil}",
+                )
                 fig_m.update_layout(
                     title="Maksymalna Koleina na Całej Trasie [mm]",
                     xaxis_title="Numer Profilu RSP",
