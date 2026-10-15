@@ -493,7 +493,6 @@ def load_multiple_lcms_files(uploaded_files_list):
         st_m = r["Station_m"]
         pid = int(round(st_m)) if st_m is not None else idx + 1
 
-        # Zapobieganie nadpisywaniu przy nakładających się indeksach w osobnych plikach
         while pid in profiles and r["Station_m"] is None:
             pid += 1
 
@@ -707,6 +706,52 @@ def build_rpd_table_df(rsp_v, lcms_v):
             "%LCMS > RSP": "-",
         },
     ])
+
+
+def render_bland_altman_conclusions(rsp_v, lcms_v, side_title, current_offset):
+    """Generuje automatyczne wnioski i interpretację z wykresu Blanda-Altmana."""
+    diffs = lcms_v - rsp_v
+    mean_diff = float(np.mean(diffs))
+    sd_diff = float(np.std(diffs, ddof=1)) if len(diffs) > 1 else 0.0
+    loa_upper = mean_diff + 1.96 * sd_diff
+    loa_lower = mean_diff - 1.96 * sd_diff
+
+    mean_v = (rsp_v + lcms_v) / 2.0
+    diff_abs = np.abs(diffs)
+    rpd = np.where(mean_v > 0, (diff_abs / mean_v) * 100.0, 0.0)
+    pct_good = (
+        (np.sum(rpd <= 30.0) / float(len(rpd))) * 100.0 if len(rpd) > 0 else 0.0
+    )
+
+    if abs(mean_diff) <= 0.8:
+        bias_desc = (
+            f"Brak istotnego obciążenia systematycznego (**{mean_diff:+.2f}"
+            " mm**). Metody LCMS i RSP dają spójny średni poziom głębokości"
+            " koleiny."
+        )
+    elif mean_diff > 0:
+        bias_desc = (
+            f"Systematyczne **zawyżanie** wyników przez LCMS o średnio"
+            f" **+{mean_diff:.2f} mm** względem profilografu RSP."
+        )
+    else:
+        bias_desc = (
+            f"Systematyczne **zaniżanie** wyników przez LCMS o średnio"
+            f" **{mean_diff:.2f} mm** względem profilografu RSP."
+        )
+
+    is_accepted = pct_good >= 80.0 and abs(mean_diff) <= 2.5
+    status_icon = "✅" if is_accepted else "⚠️"
+
+    st.markdown(
+        f"""
+    > {status_icon} **Wnioski Analityczne – {side_title}:**
+    > * **Obciążenie Systematyczne (Bias):** {bias_desc}
+    > * **Precyzja Pomiaru (LoA 95%):** 95% różnic mieści się w paśmie od **{loa_lower:+.2f} mm** do **{loa_upper:+.2f} mm** ($SD = {sd_diff:.2f}\text{{ mm}}$).
+    > * **Kryterium Spójności GDDKiA ($RPD \le 30\%$):** **{pct_good:.1f}%** punktów pomiarowych spełnia założony próg akceptowalności.
+    > * **Uwzględniona Synchronizacja Pikietażu:** Analiza została przeliczona dla przesunięcia trasy **{current_offset:+.1f} m**.
+    """
+    )
 
 
 def compute_50m_dsn_sections_full(df_ruts, step_m=1.0, section_m=50.0):
@@ -1700,7 +1745,7 @@ if bytes_rsp is not None:
             )
             st.dataframe(sanitize_df(df_sec_dsn), width="stretch")
 
-        # TAB 4: BLAND-ALTMAN & RPD GDDKiA DLA CAŁEJ TRASY
+        # TAB 4: BLAND-ALTMAN & RPD GDDKiA DLA CAŁEJ TRASY + WNIOSKI
         with tab_ba_gddkia:
             st.header("📈 Analiza Statystyczna Blanda-Altmana i RPD")
             if lcms_profiles and "LCMS_Rut_L" in df_merged_ruts.columns:
@@ -1726,6 +1771,9 @@ if bytes_rsp is not None:
                         st.table(
                             sanitize_df(build_rpd_table_df(rsp_r_v, lcms_r_v))
                         )
+                        render_bland_altman_conclusions(
+                            rsp_r_v, lcms_r_v, "PRAWA KOLEINA", całkowity_offset
+                        )
 
                     with col_ba2:
                         rsp_l_v, lcms_l_v = (
@@ -1742,6 +1790,9 @@ if bytes_rsp is not None:
                         )
                         st.table(
                             sanitize_df(build_rpd_table_df(rsp_l_v, lcms_l_v))
+                        )
+                        render_bland_altman_conclusions(
+                            rsp_l_v, lcms_l_v, "LEWA KOLEINA", całkowity_offset
                         )
                 else:
                     st.warning(
