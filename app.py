@@ -581,7 +581,6 @@ def build_bland_altman_fig(rsp_v, lcms_v, title="PRAWA KOLEINA"):
 
     fig = go.Figure()
 
-    # Punkty pomiarowe (stylizowane okręgi jak na zrzutach GDDKiA)
     fig.add_trace(
         go.Scatter(
             x=means,
@@ -601,7 +600,6 @@ def build_bland_altman_fig(rsp_v, lcms_v, title="PRAWA KOLEINA"):
         y=0, line_width=1, line_dash="solid", line_color="lightgray"
     )
 
-    # Linia średniej różnicy (Niebieska ciągła)
     fig.add_hline(
         y=mean_diff,
         line_width=3,
@@ -611,7 +609,6 @@ def build_bland_altman_fig(rsp_v, lcms_v, title="PRAWA KOLEINA"):
         annotation_font=dict(color="#0066cc", size=13, family="sans-serif"),
     )
 
-    # Górna granica zgodności +1.96 SD (Czerwona przerywana)
     fig.add_hline(
         y=loa_upper,
         line_width=2,
@@ -622,7 +619,6 @@ def build_bland_altman_fig(rsp_v, lcms_v, title="PRAWA KOLEINA"):
         annotation_font=dict(color="red", size=12),
     )
 
-    # Dolna granica zgodności -1.96 SD (Czerwona przerywana)
     fig.add_hline(
         y=loa_lower,
         line_width=2,
@@ -721,6 +717,7 @@ def compute_50m_dsn_sections_full(df_ruts, step_m=1.0, section_m=50.0):
 
         rsp_l = sub["RSP_Rut_L"].values
         rsp_r = sub["RSP_Rut_R"].values
+        rsp_max = np.maximum(rsp_l, rsp_r)
 
         e_l_rsp = np.mean(rsp_l)
         d_l_rsp = np.std(rsp_l, ddof=0)
@@ -729,6 +726,10 @@ def compute_50m_dsn_sections_full(df_ruts, step_m=1.0, section_m=50.0):
         e_r_rsp = np.mean(rsp_r)
         d_r_rsp = np.std(rsp_r, ddof=0)
         hm_r_rsp = int(np.round(e_r_rsp + 2 * d_r_rsp))
+
+        e_m_rsp = np.mean(rsp_max)
+        d_m_rsp = np.std(rsp_max, ddof=0)
+        hm_m_rsp = int(np.round(e_m_rsp + 2 * d_m_rsp))
 
         rec = {
             "Odcinek": f"{st_start} - {st_end} m",
@@ -740,11 +741,16 @@ def compute_50m_dsn_sections_full(df_ruts, step_m=1.0, section_m=50.0):
             "RSP P_KOL Dh": round(d_r_rsp, 2),
             "RSP P_KOL Hm": hm_r_rsp,
             "RSP P_KOL Klasa": get_dsn_class(hm_r_rsp),
+            "RSP MAX_KOL E(h)": round(e_m_rsp, 2),
+            "RSP MAX_KOL Dh": round(d_m_rsp, 2),
+            "RSP MAX_KOL Hm": hm_m_rsp,
+            "RSP MAX_KOL Klasa": get_dsn_class(hm_m_rsp),
         }
 
         if "LCMS_Rut_L" in sub.columns:
             lcms_l = sub["LCMS_Rut_L"].values
             lcms_r = sub["LCMS_Rut_R"].values
+            lcms_max = np.maximum(lcms_l, lcms_r)
 
             e_l_lcms = np.mean(lcms_l)
             d_l_lcms = np.std(lcms_l, ddof=0)
@@ -753,6 +759,10 @@ def compute_50m_dsn_sections_full(df_ruts, step_m=1.0, section_m=50.0):
             e_r_lcms = np.mean(lcms_r)
             d_r_lcms = np.std(lcms_r, ddof=0)
             hm_r_lcms = int(np.round(e_r_lcms + 2 * d_r_lcms))
+
+            e_m_lcms = np.mean(lcms_max)
+            d_m_lcms = np.std(lcms_max, ddof=0)
+            hm_m_lcms = int(np.round(e_m_lcms + 2 * d_m_lcms))
 
             rec.update({
                 "LCMS L_KOL E(h)": round(e_l_lcms, 2),
@@ -763,11 +773,91 @@ def compute_50m_dsn_sections_full(df_ruts, step_m=1.0, section_m=50.0):
                 "LCMS P_KOL Dh": round(d_r_lcms, 2),
                 "LCMS P_KOL Hm": hm_r_lcms,
                 "LCMS P_KOL Klasa": get_dsn_class(hm_r_lcms),
+                "LCMS MAX_KOL E(h)": round(e_m_lcms, 2),
+                "LCMS MAX_KOL Dh": round(d_m_lcms, 2),
+                "LCMS MAX_KOL Hm": hm_m_lcms,
+                "LCMS MAX_KOL Klasa": get_dsn_class(hm_m_lcms),
             })
 
         results.append(rec)
 
     return pd.DataFrame(results)
+
+
+def make_50m_bar_chart(
+    df_sec_dsn, param_prefix="P_KOL", title="Prawa Koleina (P_KOL)"
+):
+    """Tworzy wykres słupkowy oceny Hm dla odcinków 50m."""
+    fig = go.Figure()
+
+    col_rsp_hm = f"RSP {param_prefix} Hm"
+    col_rsp_klasa = f"RSP {param_prefix} Klasa"
+
+    colors_rsp = [get_dsn_color(k) for k in df_sec_dsn[col_rsp_klasa]]
+    fig.add_trace(
+        go.Bar(
+            x=df_sec_dsn["Odcinek"],
+            y=df_sec_dsn[col_rsp_hm],
+            name=f"RSP {title} (Hm)",
+            marker_color=colors_rsp,
+            text=[
+                f"{hm} mm ({k})"
+                for hm, k in zip(
+                    df_sec_dsn[col_rsp_hm], df_sec_dsn[col_rsp_klasa]
+                )
+            ],
+            textposition="auto",
+        )
+    )
+
+    col_lcms_hm = f"LCMS {param_prefix} Hm"
+    col_lcms_klasa = f"LCMS {param_prefix} Klasa"
+    if col_lcms_hm in df_sec_dsn.columns:
+        colors_lcms = [get_dsn_color(k) for k in df_sec_dsn[col_lcms_klasa]]
+        fig.add_trace(
+            go.Bar(
+                x=df_sec_dsn["Odcinek"],
+                y=df_sec_dsn[col_lcms_hm],
+                name=f"LCMS {title} (Hm)",
+                marker_color=colors_lcms,
+                opacity=0.7,
+                text=[
+                    f"{hm} mm ({k})"
+                    for hm, k in zip(
+                        df_sec_dsn[col_lcms_hm], df_sec_dsn[col_lcms_klasa]
+                    )
+                ],
+                textposition="auto",
+            )
+        )
+
+    fig.add_hline(
+        y=11,
+        line_dash="dash",
+        line_color="#ffc107",
+        annotation_text="Próg B (11mm)",
+    )
+    fig.add_hline(
+        y=21,
+        line_dash="dash",
+        line_color="#fd7e14",
+        annotation_text="Próg C (21mm)",
+    )
+    fig.add_hline(
+        y=31,
+        line_dash="dash",
+        line_color="#dc3545",
+        annotation_text="Próg D (31mm)",
+    )
+
+    fig.update_layout(
+        title=f"Ocena Hm dla Odcinków 50m – {title}",
+        xaxis_title="Odcinek Pikietażu",
+        yaxis_title="Ocena Hm [mm]",
+        barmode="group",
+        height=480,
+    )
+    return fig
 
 
 # ==========================================
@@ -782,7 +872,7 @@ if "offset_pikitaz_input" not in st.session_state:
     st.session_state["offset_pikitaz_input"] = 0.0
 
 # ==========================================
-# 5. PANEL BOCZNY (PRZEPISANE DANE I SYNCHRONIZACJA)
+# 5. PANEL BOCZNY
 # ==========================================
 st.sidebar.header("1. Dane RSP (Profilograf / Surowe)")
 uploaded_rsp = st.sidebar.file_uploader(
@@ -832,7 +922,6 @@ bytes_xml, name_xml = get_file_bytes_and_name(
     uploaded_xml, ["data/lcms.xml", "lcms.xml"]
 )
 
-# Automatyczny odczyt czujników z surowego RSP
 auto_x_from_rsp = None
 if bytes_rsp is not None and (
     name_rsp.lower().endswith(".rsp") or name_rsp.lower().endswith(".txt")
@@ -966,7 +1055,6 @@ wyrownaj_spadek_lcms = st.sidebar.checkbox(
 )
 pokaz_late_lcms = st.sidebar.checkbox("Pokaż łatę i koleiny LCMS", value=True)
 
-# Parsowanie plików GPS i LCMS
 df_rsp_gps = None
 if bytes_rsp_gps is not None:
     try:
@@ -1034,7 +1122,6 @@ if bytes_rsp is not None:
     całkowity_offset = bazowy_offset + dodatkowy_s_offset
     wybrany_profil_lcms = int(round(wybrany_profil + całkowity_offset))
 
-    # AUTOMATYCZNA SYNCHRONIZACJA BAZUJĄCA NA WYKRESIE BIEGU KOLEIN
     if lcms_profiles is not None:
         df_all_rsp_ruts = compute_all_rsp_ruts_cached(df_rsp, tuple(pozycja_x))
         list_lcms_p = sorted(lcms_profiles.keys())
@@ -1054,7 +1141,6 @@ if bytes_rsp is not None:
             )
             st.rerun()
 
-    # ZAKŁADKI GŁÓWNE
     tab_main, tab_dsn50, tab_ba_gddkia = st.tabs([
         "📐 Przekrój Poprzeczny & Cała Trasa",
         "📊 Ocena 50m DSN 2019 (Klasy A-D)",
@@ -1086,7 +1172,6 @@ if bytes_rsp is not None:
             y_vals = odczyty_raw
             y_label = "Odczyt surowy czujnika [mm]"
 
-        # RSP Crown & Hull
         i_min_mid = int(ile_laserow * 0.3)
         i_max_mid = int(ile_laserow * 0.7)
         idx_crown = i_min_mid + np.argmax(y_vals[i_min_mid : i_max_mid + 1])
@@ -1168,7 +1253,6 @@ if bytes_rsp is not None:
                 f" {całkowity_offset:+.1f} m)"
             )
 
-            # KAFELKI INFORMACYJNE
             st.markdown("##### 🟦 Dane z Profilografu RSP")
             rc1, rc2, rc3 = st.columns(3)
             klasa_rsp_l = get_dsn_class(koleina_lewa_mm)
@@ -1971,7 +2055,9 @@ if bytes_rsp is not None:
 
         # --- ZAKŁADKA 2: OCENA 50M DSN 2019 ---
         with tab_dsn50:
-            st.header("📊 Ocena Stanu Koleiny dla Odcinków 50-metrowych (DSN 2019)")
+            st.header(
+                "📊 Ocena Stanu Koleiny dla Odcinków 50-metrowych (DSN 2019)"
+            )
             st.markdown(
                 r"""
             Wzór normowy oceny odcinkowej $H_m$:
@@ -2018,79 +2104,36 @@ if bytes_rsp is not None:
                 df_merged_ruts, step_m=1.0, section_m=50.0
             )
 
-            # WYKRES SŁUPKOWY KLASYFIKACJI H_M DLA ODCINKÓW 50M
-            fig_sec = go.Figure()
+            # SUB-TABS DLA ODCINKÓW 50M
+            sub_dsn_l, sub_dsn_p, sub_dsn_max = st.tabs([
+                "👈 Lewa Koleina (L_KOL)",
+                "👉 Prawa Koleina (P_KOL)",
+                "🔝 Koleina Maksymalna (MAX_KOL)",
+            ])
 
-            # RSP P_KOL
-            colors_rsp_p = [
-                get_dsn_color(k) for k in df_sec_dsn["RSP P_KOL Klasa"]
-            ]
-            fig_sec.add_trace(
-                go.Bar(
-                    x=df_sec_dsn["Odcinek"],
-                    y=df_sec_dsn["RSP P_KOL Hm"],
-                    name="RSP Prawa Koleina (Hm)",
-                    marker_color=colors_rsp_p,
-                    text=[
-                        f"{hm} mm ({k})"
-                        for hm, k in zip(
-                            df_sec_dsn["RSP P_KOL Hm"],
-                            df_sec_dsn["RSP P_KOL Klasa"],
-                        )
-                    ],
-                    textposition="auto",
+            with sub_dsn_l:
+                fig_sec_l = make_50m_bar_chart(
+                    df_sec_dsn,
+                    param_prefix="L_KOL",
+                    title="Lewa Koleina (L_KOL)",
                 )
-            )
+                st.plotly_chart(fig_sec_l, use_container_width=True)
 
-            if "LCMS P_KOL Hm" in df_sec_dsn.columns:
-                colors_lcms_p = [
-                    get_dsn_color(k) for k in df_sec_dsn["LCMS P_KOL Klasa"]
-                ]
-                fig_sec.add_trace(
-                    go.Bar(
-                        x=df_sec_dsn["Odcinek"],
-                        y=df_sec_dsn["LCMS P_KOL Hm"],
-                        name="LCMS Prawa Koleina (Hm)",
-                        marker_color=colors_lcms_p,
-                        opacity=0.7,
-                        text=[
-                            f"{hm} mm ({k})"
-                            for hm, k in zip(
-                                df_sec_dsn["LCMS P_KOL Hm"],
-                                df_sec_dsn["LCMS P_KOL Klasa"],
-                            )
-                        ],
-                        textposition="auto",
-                    )
+            with sub_dsn_p:
+                fig_sec_p = make_50m_bar_chart(
+                    df_sec_dsn,
+                    param_prefix="P_KOL",
+                    title="Prawa Koleina (P_KOL)",
                 )
+                st.plotly_chart(fig_sec_p, use_container_width=True)
 
-            fig_sec.add_hline(
-                y=11,
-                line_dash="dash",
-                line_color="#ffc107",
-                annotation_text="Próg B (11mm)",
-            )
-            fig_sec.add_hline(
-                y=21,
-                line_dash="dash",
-                line_color="#fd7e14",
-                annotation_text="Próg C (21mm)",
-            )
-            fig_sec.add_hline(
-                y=31,
-                line_dash="dash",
-                line_color="#dc3545",
-                annotation_text="Próg D (31mm)",
-            )
-
-            fig_sec.update_layout(
-                title="Ocena Hm dla Odcinków 50m – Prawa Koleina (P_KOL)",
-                xaxis_title="Odcinek Pikietażu",
-                yaxis_title="Ocena Hm [mm]",
-                barmode="group",
-                height=480,
-            )
-            st.plotly_chart(fig_sec, use_container_width=True)
+            with sub_dsn_max:
+                fig_sec_max = make_50m_bar_chart(
+                    df_sec_dsn,
+                    param_prefix="MAX_KOL",
+                    title="Koleina Maksymalna (MAX_KOL)",
+                )
+                st.plotly_chart(fig_sec_max, use_container_width=True)
 
             st.markdown("##### Tabela Zbiorcza Odcinkowej Oceny 50m (DSN 2019)")
             st.dataframe(df_sec_dsn, use_container_width=True)
@@ -2109,7 +2152,6 @@ if bytes_rsp is not None:
                 lcms_l_v = df_merged_ruts["LCMS_Rut_L"].values
                 lcms_r_v = df_merged_ruts["LCMS_Rut_R"].values
 
-                # WYKRESY BLANDA-ALTMANA
                 col_ba1, col_ba2 = st.columns(2)
 
                 with col_ba1:
@@ -2148,7 +2190,6 @@ if bytes_rsp is not None:
                     df_rpd_l = build_rpd_table_df(rsp_l_v, lcms_l_v)
                     st.table(df_rpd_l)
 
-                # AUTOMATYCZNY RAPORT
                 st.markdown("---")
                 st.subheader("📑 Wnioski i Raport Analityczny GDDKiA")
 
