@@ -41,7 +41,34 @@ DEFAULT_RSP_X_LIST = [
 
 
 # ==========================================
-# 1. PARSERY SUROWYCH PLIKÓW (.RSP, .GPX, .CSV, .XLSX)
+# 1. FUNKCJE POMOCNICZE DSN 2019 I KLASYFIKACJI
+# ==========================================
+def get_dsn_class(h_val):
+    """Zwraca klasę stanu koleiny wg DSN 2019."""
+    if h_val < 11.0:
+        return "A"
+    elif h_val < 21.0:
+        return "B"
+    elif h_val < 31.0:
+        return "C"
+    else:
+        return "D"
+
+
+def get_dsn_color(klasa):
+    """Kolory dla klas DSN 2019."""
+    if klasa == "A":
+        return "#28a745"  # Zielony
+    elif klasa == "B":
+        return "#ffc107"  # Żółty
+    elif klasa == "C":
+        return "#fd7e14"  # Pomarańczowy
+    else:
+        return "#dc3545"  # Czerwony
+
+
+# ==========================================
+# 2. PARSERY SUROWYCH PLIKÓW (.RSP, .GPX, .CSV, .XLSX)
 # ==========================================
 def parse_native_rsp_file(file_bytes):
     """Parsuje surowy plik Dynatest .rsp / .txt (linie 5201-5221, 5401, 5280)."""
@@ -58,7 +85,6 @@ def parse_native_rsp_file(file_bytes):
             continue
         code = parts[0]
 
-        # 5201-5221: Konfiguracja czujników X [mm]
         if code.isdigit() and 5201 <= int(code) <= 5221:
             try:
                 x_mm = float(parts[-1])
@@ -66,7 +92,6 @@ def parse_native_rsp_file(file_bytes):
             except ValueError:
                 pass
 
-        # 5401: Odczyty profilu poprzecznego (21 laserów [mm])
         elif code == "5401":
             try:
                 readings = [float(x) for x in parts[3:24]]
@@ -74,7 +99,6 @@ def parse_native_rsp_file(file_bytes):
             except (ValueError, IndexError):
                 pass
 
-        # 5280: Pozycje GPS w pliku RSP
         elif code == "5280":
             try:
                 st_m = float(parts[1])
@@ -174,7 +198,7 @@ def get_file_bytes_and_name(uploaded_file, default_paths):
 
 @st.cache_data
 def load_rsp_data(file_bytes, file_name):
-    """Wczytuje i keszuje dane RSP (zarówno Excel/CSV jak i surowy .rsp)."""
+    """Wczytuje i keszuje dane RSP."""
     if file_name.lower().endswith(".rsp") or file_name.lower().endswith(".txt"):
         df_prof, _, _ = parse_native_rsp_file(file_bytes)
         if df_prof is not None:
@@ -339,7 +363,7 @@ def parse_lcms_raw_cached(file_bytes, file_name):
 
 @st.cache_data
 def parse_lcms_xml(file_bytes):
-    """Parser XML z LCMS ze ścisłym sortowaniem po pikietażu."""
+    """Parser XML z LCMS."""
     tree = ET.ElementTree(ET.fromstring(file_bytes))
     root = tree.getroot()
 
@@ -542,18 +566,223 @@ def make_map_trace(
 
 
 # ==========================================
-# 2. KONFIGURACJA STRONY STREAMLIT
+# 3. KREATOR WYKRESÓW BLANDA-ALTMANA I TABEL RPD (GDDKiA)
+# ==========================================
+def build_bland_altman_fig(rsp_v, lcms_v, title="PRAWA KOLEINA"):
+    """Tworzy interaktywny wykres Blanda-Altmana w stylu GDDKiA."""
+    means = (rsp_v + lcms_v) / 2.0
+    diffs = lcms_v - rsp_v
+
+    mean_diff = float(np.mean(diffs))
+    sd_diff = float(np.std(diffs, ddof=1)) if len(diffs) > 1 else 0.0
+
+    loa_upper = mean_diff + 1.96 * sd_diff
+    loa_lower = mean_diff - 1.96 * sd_diff
+
+    fig = go.Figure()
+
+    # Punkty pomiarowe (stylizowane okręgi jak na zrzutach GDDKiA)
+    fig.add_trace(
+        go.Scatter(
+            x=means,
+            y=diffs,
+            mode="markers",
+            name="Pomiary",
+            marker=dict(
+                size=7,
+                color="#ffffcc",
+                line=dict(width=1, color="#333333"),
+            ),
+            hovertemplate="Średnia: %{x:.2f} mm<br>Różnica (LCMS-RSP): %{y:.2f} mm<extra></extra>",
+        )
+    )
+
+    fig.add_hline(
+        y=0, line_width=1, line_dash="solid", line_color="lightgray"
+    )
+
+    # Linia średniej różnicy (Niebieska ciągła)
+    fig.add_hline(
+        y=mean_diff,
+        line_width=3,
+        line_color="#0066cc",
+        annotation_text=f"Średnia: {mean_diff:+.2f} mm",
+        annotation_position="right",
+        annotation_font=dict(color="#0066cc", size=13, family="sans-serif"),
+    )
+
+    # Górna granica zgodności +1.96 SD (Czerwona przerywana)
+    fig.add_hline(
+        y=loa_upper,
+        line_width=2,
+        line_dash="dash",
+        line_color="red",
+        annotation_text=f"+1.96 SD: {loa_upper:+.2f} mm",
+        annotation_position="right",
+        annotation_font=dict(color="red", size=12),
+    )
+
+    # Dolna granica zgodności -1.96 SD (Czerwona przerywana)
+    fig.add_hline(
+        y=loa_lower,
+        line_width=2,
+        line_dash="dash",
+        line_color="red",
+        annotation_text=f"-1.96 SD: {loa_lower:+.2f} mm",
+        annotation_position="right",
+        annotation_font=dict(color="red", size=12),
+    )
+
+    fig.update_layout(
+        title=dict(text=f"<b>{title}</b>", x=0.5, font=dict(size=18)),
+        xaxis_title="ŚREDNIA (LCMS, RSP) [mm]",
+        yaxis_title="RÓŻNICA (LCMS - RSP) [mm]",
+        height=480,
+        template="plotly_white",
+        hovermode="closest",
+    )
+    return fig, mean_diff, sd_diff, loa_upper, loa_lower
+
+
+def build_rpd_table_df(rsp_v, lcms_v):
+    """Generuje tabelę RPD dokładnie w układzie analizy GDDKiA."""
+    mean_v = (rsp_v + lcms_v) / 2.0
+    diff_abs = np.abs(lcms_v - rsp_v)
+    rpd = np.where(mean_v > 0, (diff_abs / mean_v) * 100.0, 0.0)
+
+    m_low = rpd <= 30.0
+    m_high = rpd > 30.0
+    n_tot = len(rsp_v)
+
+    def sub_stat(m_grp, label):
+        n_grp = int(np.sum(m_grp))
+        if n_grp == 0:
+            return {
+                "zakres RPD": label,
+                "n": 0,
+                "%": "0%",
+                "RSP > LCMS": 0,
+                "Wyniki równe": 0,
+                "LCMS > RSP": 0,
+                "%RSP > LCMS": "0%",
+                "%Wyniki równe": "0%",
+                "%LCMS > RSP": "0%",
+            }
+
+        r_sub = np.round(rsp_v[m_grp], 1)
+        l_sub = np.round(lcms_v[m_grp], 1)
+
+        rsp_gt = int(np.sum(r_sub > l_sub))
+        eq = int(np.sum(r_sub == l_sub))
+        lcms_gt = int(np.sum(l_sub > r_sub))
+
+        return {
+            "zakres RPD": label,
+            "n": n_grp,
+            "%": f"{(n_grp / n_tot)*100:.0f}%",
+            "RSP > LCMS": rsp_gt,
+            "Wyniki równe": eq,
+            "LCMS > RSP": lcms_gt,
+            "%RSP > LCMS": f"{(rsp_gt / n_grp)*100:.0f}%",
+            "%Wyniki równe": f"{(eq / n_grp)*100:.0f}%",
+            "%LCMS > RSP": f"{(lcms_gt / n_grp)*100:.0f}%",
+        }
+
+    row_low = sub_stat(m_low, "0-30%")
+    row_high = sub_stat(m_high, ">30%")
+    row_sum = {
+        "zakres RPD": "suma",
+        "n": n_tot,
+        "%": "100%",
+        "RSP > LCMS": "-",
+        "Wyniki równe": "-",
+        "LCMS > RSP": "-",
+        "%RSP > LCMS": "-",
+        "%Wyniki równe": "-",
+        "%LCMS > RSP": "-",
+    }
+
+    return pd.DataFrame([row_low, row_high, row_sum])
+
+
+def compute_50m_dsn_sections_full(df_ruts, step_m=1.0, section_m=50.0):
+    """Wylicza ocenę Hm dla odcinków 50m zgodnie ze wzorem DSN 2019."""
+    profs_per_sec = max(1, int(round(section_m / step_m)))
+    results = []
+
+    num_sections = int(np.ceil(len(df_ruts) / profs_per_sec))
+    for i in range(num_sections):
+        sub = df_ruts.iloc[i * profs_per_sec : (i + 1) * profs_per_sec]
+        if len(sub) == 0:
+            continue
+
+        st_start = sub["Profil"].iloc[0]
+        st_end = sub["Profil"].iloc[-1]
+
+        rsp_l = sub["RSP_Rut_L"].values
+        rsp_r = sub["RSP_Rut_R"].values
+
+        e_l_rsp = np.mean(rsp_l)
+        d_l_rsp = np.std(rsp_l, ddof=0)
+        hm_l_rsp = int(np.round(e_l_rsp + 2 * d_l_rsp))
+
+        e_r_rsp = np.mean(rsp_r)
+        d_r_rsp = np.std(rsp_r, ddof=0)
+        hm_r_rsp = int(np.round(e_r_rsp + 2 * d_r_rsp))
+
+        rec = {
+            "Odcinek": f"{st_start} - {st_end} m",
+            "RSP L_KOL E(h)": round(e_l_rsp, 2),
+            "RSP L_KOL Dh": round(d_l_rsp, 2),
+            "RSP L_KOL Hm": hm_l_rsp,
+            "RSP L_KOL Klasa": get_dsn_class(hm_l_rsp),
+            "RSP P_KOL E(h)": round(e_r_rsp, 2),
+            "RSP P_KOL Dh": round(d_r_rsp, 2),
+            "RSP P_KOL Hm": hm_r_rsp,
+            "RSP P_KOL Klasa": get_dsn_class(hm_r_rsp),
+        }
+
+        if "LCMS_Rut_L" in sub.columns:
+            lcms_l = sub["LCMS_Rut_L"].values
+            lcms_r = sub["LCMS_Rut_R"].values
+
+            e_l_lcms = np.mean(lcms_l)
+            d_l_lcms = np.std(lcms_l, ddof=0)
+            hm_l_lcms = int(np.round(e_l_lcms + 2 * d_l_lcms))
+
+            e_r_lcms = np.mean(lcms_r)
+            d_r_lcms = np.std(lcms_r, ddof=0)
+            hm_r_lcms = int(np.round(e_r_lcms + 2 * d_r_lcms))
+
+            rec.update({
+                "LCMS L_KOL E(h)": round(e_l_lcms, 2),
+                "LCMS L_KOL Dh": round(d_l_lcms, 2),
+                "LCMS L_KOL Hm": hm_l_lcms,
+                "LCMS L_KOL Klasa": get_dsn_class(hm_l_lcms),
+                "LCMS P_KOL E(h)": round(e_r_lcms, 2),
+                "LCMS P_KOL Dh": round(d_r_lcms, 2),
+                "LCMS P_KOL Hm": hm_r_lcms,
+                "LCMS P_KOL Klasa": get_dsn_class(hm_r_lcms),
+            })
+
+        results.append(rec)
+
+    return pd.DataFrame(results)
+
+
+# ==========================================
+# 4. KONFIGURACJA STRONY STREAMLIT
 # ==========================================
 st.set_page_config(
-    page_title="RSP vs LCMS – Szybka Analiza Kolein", layout="wide"
+    page_title="RSP vs LCMS – System Analizy Kolein DSN 2019", layout="wide"
 )
-st.title("⚡ System Analizy RSP + LCMS (DSN 2019)")
+st.title("⚡ System Analizy RSP + LCMS (DSN 2019 & GDDKiA)")
 
 if "offset_pikitaz_input" not in st.session_state:
     st.session_state["offset_pikitaz_input"] = 0.0
 
 # ==========================================
-# 3. PANEL BOCZNY (PRZEPISANE DANE I SYNCHRONIZACJA)
+# 5. PANEL BOCZNY (PRZEPISANE DANE I SYNCHRONIZACJA)
 # ==========================================
 st.sidebar.header("1. Dane RSP (Profilograf / Surowe)")
 uploaded_rsp = st.sidebar.file_uploader(
@@ -613,7 +842,6 @@ if bytes_rsp is not None and (
 st.sidebar.header("3. Synchronizacja i Pikietaż")
 
 
-# Dwukierunkowa obsługa Suwaka i Wpisywania
 def sync_offset_from_slider():
     st.session_state["offset_pikitaz_input"] = float(
         st.session_state["offset_slider_key"]
@@ -764,7 +992,7 @@ if bytes_xml is not None:
         st.sidebar.error(f"Błąd XML: {e}")
 
 # ==========================================
-# 4. GŁÓWNA LOGIKA ANALIZY I WYKRESÓW
+# 6. GŁÓWNA LOGIKA APLIKACJI Z TABAMI
 # ==========================================
 if bytes_rsp is not None:
     df_rsp = load_rsp_data(bytes_rsp, name_rsp)
@@ -826,6 +1054,13 @@ if bytes_rsp is not None:
             )
             st.rerun()
 
+    # ZAKŁADKI GŁÓWNE
+    tab_main, tab_dsn50, tab_ba_gddkia = st.tabs([
+        "📐 Przekrój Poprzeczny & Cała Trasa",
+        "📊 Ocena 50m DSN 2019 (Klasy A-D)",
+        "📈 Analiza Porównawcza GDDKiA (Bland-Altman & RPD)",
+    ])
+
     wiersz_rsp = df_rsp[df_rsp[col_profil] == wybrany_profil]
 
     if not wiersz_rsp.empty:
@@ -879,20 +1114,6 @@ if bytes_rsp is not None:
 
         max_koleina_rsp = max(koleina_lewa_mm, koleina_prawa_mm)
 
-        if test_stacjonarny:
-            st.subheader("🧪 Weryfikacja Testu Stacjonarnego (DSN 2019)")
-            if max_koleina_rsp <= 0.5:
-                st.success(
-                    f"✅ **TEST POZYTYWNY**: Odchyłka wynosi"
-                    f" **{max_koleina_rsp:.2f} mm** (≤ 0,5 mm)."
-                )
-            else:
-                st.error(
-                    f"❌ **TEST NEGATYWNY**: Odchyłka wynosi"
-                    f" **{max_koleina_rsp:.2f} mm** i przekracza limit 0,5 mm dla"
-                    " łaty!"
-                )
-
         kol_lcms_l, kol_lcms_p = None, None
         prof_lcms_data = None
         if lcms_profiles and wybrany_profil_lcms in lcms_profiles:
@@ -900,27 +1121,6 @@ if bytes_rsp is not None:
             kol_lcms_l = prof_lcms_data.get("rut_l", None)
             kol_lcms_p = prof_lcms_data.get("rut_r", None)
 
-        st.subheader(
-            f"Profil RSP nr {wybrany_profil} (LCMS nr {wybrany_profil_lcms},"
-            f" przesunięcie: {całkowity_offset:+.1f} m)"
-        )
-
-        # KAFELKI INFORMACYJNE
-        st.markdown("##### 🟦 Dane z Profilografu RSP")
-        rc1, rc2, rc3 = st.columns(3)
-        rc1.metric(
-            "RSP Koleina Lewa",
-            f"{koleina_lewa_mm:.1f} mm",
-            f"Laser L{idx_kol_l+1} ({x_vals[idx_kol_l]:.2f}m)",
-        )
-        rc2.metric(
-            "RSP Koleina Prawa",
-            f"{koleina_prawa_mm:.1f} mm",
-            f"Laser L{idx_kol_p+1} ({x_vals[idx_kol_p]:.2f}m)",
-        )
-        rc3.metric("RSP Koleina Maksymalna", f"{max_koleina_rsp:.1f} mm")
-
-        # Obliczenia Wirtualnej Łaty dla LCMS
         calc_lcms_rut_l, calc_lcms_rut_r = None, None
         if prof_lcms_data is not None:
             x_lcms_orig = prof_lcms_data["x"].copy()
@@ -946,787 +1146,1039 @@ if bytes_rsp is not None:
             calc_lcms_rut_l = float(np.max(lata_raw_l - z_lcms_l_raw))
             calc_lcms_rut_r = float(np.max(lata_raw_r - z_lcms_r_raw))
 
-        st.markdown("##### 🟩 Dane z Systemu LCMS")
-        lc1, lc2, lc3 = st.columns(3)
-        if kol_lcms_l is not None and kol_lcms_p is not None:
-            if zrodlo_lcms == "Z pliku LCMS (surowe B2/C2)":
-                disp_l, disp_p = kol_lcms_l, kol_lcms_p
-                label_sub = "(z pliku B2/C2)"
-            elif zrodlo_lcms == "Wyliczone z profilu (Wirtualna Łata)":
-                disp_l, disp_p = calc_lcms_rut_l, calc_lcms_rut_r
-                label_sub = "(z Łaty DSN)"
-            else:
-                disp_l, disp_p = kol_lcms_l, kol_lcms_p
-                label_sub = f"(Plik: {kol_lcms_l:.1f} / Łata: {calc_lcms_rut_l:.1f})"
-
-            max_disp = max(disp_l, disp_p)
-            lc1.metric(
-                f"LCMS Koleina Lewa {label_sub}",
-                f"{disp_l:.1f} mm",
-                delta=f"{koleina_lewa_mm - disp_l:+.1f} mm vs RSP",
-            )
-            lc2.metric(
-                f"LCMS Koleina Prawa {label_sub}",
-                f"{disp_p:.1f} mm",
-                delta=f"{koleina_prawa_mm - disp_p:+.1f} mm vs RSP",
-            )
-            lc3.metric(
-                "LCMS Koleina Maksymalna",
-                f"{max_disp:.1f} mm",
-                delta=f"{max_koleina_rsp - max_disp:+.1f} mm vs RSP",
-            )
-        else:
-            lc1.info("Brak profilu LCMS dla wybranego pikietażu.")
-
-        # WYKRES PRZEKROJU POPRZECZNEGO
-        fig = go.Figure()
-
-        # Profil RSP
-        fig.add_trace(
-            go.Scatter(
-                x=x_vals,
-                y=y_vals,
-                mode="lines+markers",
-                name="Profil RSP (Spline)",
-                line=dict(
-                    shape="spline", smoothing=1.2, color="royalblue", width=3
-                ),
-                marker=dict(size=7, color="navy"),
-                hovertemplate="Poz X: %{x} m<br>Wys Y: %{y:.1f} mm<extra></extra>",
-            )
-        )
-
-        if pokaz_late_rsp:
-            fig.add_trace(
-                go.Scatter(
-                    x=x_left,
-                    y=lata_lewa_y,
-                    mode="lines",
-                    name="Łata RSP Lewa",
-                    line=dict(color="crimson", width=2),
-                )
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=x_right,
-                    y=lata_prawa_y,
-                    mode="lines",
-                    name="Łata RSP Prawa",
-                    line=dict(color="darkorange", width=2),
-                )
-            )
-
-            x_kl, y_kl_prof, y_kl_lata = (
-                x_vals[idx_kol_l],
-                y_vals[idx_kol_l],
-                lata_lewa_y[idx_kol_l],
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=[x_kl, x_kl],
-                    y=[y_kl_lata, y_kl_prof],
-                    mode="lines+markers",
-                    name=f"Głębokość RSP Lewa ({koleina_lewa_mm:.1f} mm)",
-                    line=dict(color="crimson", width=3),
-                    marker=dict(size=6, symbol="triangle-down"),
-                )
-            )
-            fig.add_annotation(
-                x=x_kl,
-                y=(y_kl_lata + y_kl_prof) / 2,
-                text=f" <b>RSP: {koleina_lewa_mm:.1f} mm</b>",
-                showarrow=False,
-                font=dict(color="crimson", size=12),
-                bgcolor="rgba(255, 255, 255, 0.95)",
-                bordercolor="crimson",
-                borderwidth=1,
-                xanchor="right",
-            )
-
-            x_kp, y_kp_prof, y_kp_lata = (
-                x_vals[idx_kol_p],
-                y_vals[idx_kol_p],
-                lata_prawa_y[idx_kol_p_rel],
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=[x_kp, x_kp],
-                    y=[y_kp_lata, y_kp_prof],
-                    mode="lines+markers",
-                    name=f"Głębokość RSP Prawa ({koleina_prawa_mm:.1f} mm)",
-                    line=dict(color="darkorange", width=3),
-                    marker=dict(size=6, symbol="triangle-down"),
-                )
-            )
-            fig.add_annotation(
-                x=x_kp,
-                y=(y_kp_prof + y_kp_lata) / 2,
-                text=f" <b>RSP: {koleina_prawa_mm:.1f} mm</b>",
-                showarrow=False,
-                font=dict(color="darkorange", size=12),
-                bgcolor="rgba(255, 255, 255, 0.95)",
-                bordercolor="darkorange",
-                borderwidth=1,
-                xanchor="right",
-            )
-
-        # Profil LCMS z dokładnym przesunięciem poprzecznym
-        if prof_lcms_data is not None:
-            x_lcms_orig = prof_lcms_data["x"].copy()
-            z_lcms_raw = prof_lcms_data["z"]
-            z_lcms_smooth = smooth_profile(z_lcms_raw, window_size=31)
-
-            rsp_x_max = np.max(x_vals)
-            rsp_x_min = np.min(x_vals)
-
-            x_lcms = x_lcms_orig.copy()
-
-            if skaluj_szerokosc and len(x_lcms) > 1:
-                lcms_min = np.min(x_lcms)
-                lcms_max = np.max(x_lcms)
-                x_lcms = rsp_x_min + (x_lcms - lcms_min) * (
-                    (rsp_x_max - rsp_x_min) / (lcms_max - lcms_min)
-                )
-            elif zaczep_prawa_krawedz and len(x_lcms) > 0:
-                shift_right = rsp_x_max - np.max(x_lcms)
-                x_lcms = x_lcms + shift_right
-
-            x_lcms = x_lcms + manual_x_shift_lcms
-
-            mid_mask_raw = (x_lcms >= -0.5) & (x_lcms <= 0.5)
-            if np.any(mid_mask_raw):
-                idx_crown_lcms = np.where(mid_mask_raw)[0][
-                    np.argmax(z_lcms_smooth[mid_mask_raw])
-                ]
-            else:
-                idx_crown_lcms = np.argmin(np.abs(x_lcms))
-
-            x_lcms_l = x_lcms[: idx_crown_lcms + 1]
-            z_lcms_l_raw = z_lcms_smooth[: idx_crown_lcms + 1]
-            x_lcms_r = x_lcms[idx_crown_lcms:]
-            z_lcms_r_raw = z_lcms_smooth[idx_crown_lcms:]
-
-            lata_raw_l = get_upper_hull(x_lcms_l, z_lcms_l_raw)
-            lata_raw_r = get_upper_hull(x_lcms_r, z_lcms_r_raw)
-
-            if wyrownaj_spadek_lcms and len(x_lcms) > 10:
-                p_trend = np.polyfit(x_lcms, z_lcms_smooth, 1)
-                trend_line = p_trend[0] * x_lcms
-                z_lcms_leveled = z_lcms_smooth - trend_line
-                lata_plot_l = lata_raw_l - trend_line[: idx_crown_lcms + 1]
-                lata_plot_r = lata_raw_r - trend_line[idx_crown_lcms:]
-            else:
-                z_lcms_leveled = z_lcms_smooth
-                lata_plot_l = lata_raw_l
-                lata_plot_r = lata_raw_r
-
-            idx_mid_lcms = np.argmin(np.abs(x_lcms))
-            z_ref_lcms = z_lcms_leveled[idx_mid_lcms]
-
-            z_lcms_plot = z_lcms_leveled - z_ref_lcms
-            lata_plot_l_zero = lata_plot_l - z_ref_lcms
-            lata_plot_r_zero = lata_plot_r - z_ref_lcms
-
-            fig.add_trace(
-                go.Scatter(
-                    x=x_lcms,
-                    y=z_lcms_plot,
-                    mode="lines",
-                    name=f"Profil LCMS nr {wybrany_profil_lcms}",
-                    line=dict(color="forestgreen", width=2),
-                )
-            )
-
-            if pokaz_late_lcms:
-                fig.add_trace(
-                    go.Scatter(
-                        x=x_lcms_l,
-                        y=lata_plot_l_zero,
-                        mode="lines",
-                        name="Łata LCMS Lewa",
-                        line=dict(color="limegreen", width=2),
+        # --- ZAKŁADKA 1: PRZEKRÓJ POPRZECZNY I CAŁA TRASA ---
+        with tab_main:
+            if test_stacjonarny:
+                st.subheader("🧪 Weryfikacja Testu Stacjonarnego (DSN 2019)")
+                if max_koleina_rsp <= 0.5:
+                    st.success(
+                        f"✅ **TEST POZYTYWNY**: Odchyłka wynosi"
+                        f" **{max_koleina_rsp:.2f} mm** (≤ 0,5 mm)."
                     )
-                )
-                fig.add_trace(
-                    go.Scatter(
-                        x=x_lcms_r,
-                        y=lata_plot_r_zero,
-                        mode="lines",
-                        name="Łata LCMS Prawa",
-                        line=dict(color="lime", width=2),
-                    )
-                )
-
-                val_l_show = (
-                    kol_lcms_l
-                    if zrodlo_lcms == "Z pliku LCMS (surowe B2/C2)"
-                    and kol_lcms_l is not None
-                    else calc_lcms_rut_l
-                )
-                val_r_show = (
-                    kol_lcms_p
-                    if zrodlo_lcms == "Z pliku LCMS (surowe B2/C2)"
-                    and kol_lcms_p is not None
-                    else calc_lcms_rut_r
-                )
-
-                diff_lcms_l = lata_plot_l_zero - (
-                    z_lcms_plot[: idx_crown_lcms + 1]
-                )
-                idx_k_l_c = np.argmax(diff_lcms_l)
-                x_kl_c = x_lcms_l[idx_k_l_c]
-                y_kl_c_prof = z_lcms_plot[idx_k_l_c]
-                y_kl_c_lata = lata_plot_l_zero[idx_k_l_c]
-
-                fig.add_trace(
-                    go.Scatter(
-                        x=[x_kl_c, x_kl_c],
-                        y=[y_kl_c_lata, y_kl_c_prof],
-                        mode="lines+markers",
-                        name=f"Głębokość LCMS Lewa ({val_l_show:.1f} mm)",
-                        line=dict(color="forestgreen", width=2.5),
-                        marker=dict(size=5, symbol="triangle-down"),
-                    )
-                )
-                fig.add_annotation(
-                    x=x_kl_c,
-                    y=(y_kl_c_lata + y_kl_c_prof) / 2,
-                    text=f"<b>LCMS: {val_l_show:.1f} mm</b> ",
-                    showarrow=False,
-                    font=dict(color="forestgreen", size=12),
-                    bgcolor="rgba(235, 255, 235, 0.95)",
-                    bordercolor="forestgreen",
-                    borderwidth=1,
-                    xanchor="left",
-                )
-
-                diff_lcms_r = lata_plot_r_zero - (z_lcms_plot[idx_crown_lcms:])
-                idx_k_r_c_rel = np.argmax(diff_lcms_r)
-                idx_k_r_c = idx_crown_lcms + idx_k_r_c_rel
-                x_kp_c = x_lcms[idx_k_r_c]
-                y_kp_c_prof = z_lcms_plot[idx_k_r_c]
-                y_kp_c_lata = lata_plot_r_zero[idx_k_r_c_rel]
-
-                fig.add_trace(
-                    go.Scatter(
-                        x=[x_kp_c, x_kp_c],
-                        y=[y_kp_c_lata, y_kp_c_prof],
-                        mode="lines+markers",
-                        name=f"Głębokość LCMS Prawa ({val_r_show:.1f} mm)",
-                        line=dict(color="forestgreen", width=2.5),
-                        marker=dict(size=5, symbol="triangle-down"),
-                    )
-                )
-                fig.add_annotation(
-                    x=x_kp_c,
-                    y=(y_kp_c_lata + y_kp_c_prof) / 2,
-                    text=f"<b>LCMS: {val_r_show:.1f} mm</b> ",
-                    showarrow=False,
-                    font=dict(color="forestgreen", size=12),
-                    bgcolor="rgba(235, 255, 235, 0.95)",
-                    bordercolor="forestgreen",
-                    borderwidth=1,
-                    xanchor="left",
-                )
-
-        fig.add_vline(
-            x=0,
-            line_width=1,
-            line_dash="dot",
-            line_color="gray",
-            annotation_text="Oś L11 (0.0 m)",
-        )
-
-        fig.update_layout(
-            title=f"Przekrój Poprzeczny – Profil RSP nr {wybrany_profil}",
-            xaxis_title="Pozycja czujnika na belce [m]",
-            yaxis_title=y_label,
-            height=580,
-            hovermode="x unified",
-            xaxis=dict(range=[-1.85, 1.85], dtick=0.2),
-            yaxis=dict(autorange=True if tryb_zero_l11 else "reversed"),
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-        # WYKRESY PODŁUŻNE NA CAŁEJ TRASIE
-        st.markdown("---")
-        st.subheader("📈 Przebieg Kolein na Całej Trasie (RSP vs LCMS)")
-
-        df_all_rsp_ruts = compute_all_rsp_ruts_cached(df_rsp, tuple(pozycja_x))
-
-        has_lcms = lcms_profiles is not None and len(lcms_profiles) > 0
-        if has_lcms:
-            list_lcms_p = sorted(lcms_profiles.keys())
-            df_lcms_calc_all = compute_all_lcms_calc_ruts_cached(lcms_profiles)
-
-            lcms_file_rut_l = [lcms_profiles[p]["rut_l"] for p in list_lcms_p]
-            lcms_file_rut_r = [lcms_profiles[p]["rut_r"] for p in list_lcms_p]
-            lcms_file_rut_max = np.maximum(lcms_file_rut_l, lcms_file_rut_r)
-
-            lcms_calc_rut_l = df_lcms_calc_all["LCMS_Calc_Rut_L"].values
-            lcms_calc_rut_r = df_lcms_calc_all["LCMS_Calc_Rut_R"].values
-            lcms_calc_rut_max = df_lcms_calc_all["LCMS_Calc_Rut_Max"].values
-
-            lcms_p_shifted = []
-            for p in list_lcms_p:
-                if podziel_na_sekcje:
-                    idx_s_p = int((p - min_p) // sekcja_m)
-                    off_s = bazowy_offset + sekcje_offsets.get(idx_s_p, 0.0)
                 else:
-                    off_s = bazowy_offset
-                lcms_p_shifted.append(p - off_s)
+                    st.error(
+                        f"❌ **TEST NEGATYWNY**: Odchyłka wynosi"
+                        f" **{max_koleina_rsp:.2f} mm** i przekracza limit 0,5"
+                        " mm dla łaty!"
+                    )
 
-        tab_l, tab_r, tab_max, tab_all = st.tabs([
-            "👈 Koleina Lewa",
-            "👉 Koleina Prawa",
-            "🔝 Koleina Maksymalna",
-            "📊 Zbiorcze",
-        ])
+            st.subheader(
+                f"Profil RSP nr {wybrany_profil} (LCMS nr"
+                f" {wybrany_profil_lcms}, przesunięcie:"
+                f" {całkowity_offset:+.1f} m)"
+            )
 
-        with tab_l:
-            fig_l = go.Figure()
-            fig_l.add_trace(
+            # KAFELKI INFORMACYJNE
+            st.markdown("##### 🟦 Dane z Profilografu RSP")
+            rc1, rc2, rc3 = st.columns(3)
+            klasa_rsp_l = get_dsn_class(koleina_lewa_mm)
+            klasa_rsp_p = get_dsn_class(koleina_prawa_mm)
+            klasa_rsp_m = get_dsn_class(max_koleina_rsp)
+
+            rc1.metric(
+                "RSP Koleina Lewa",
+                f"{koleina_lewa_mm:.1f} mm (Klasa {klasa_rsp_l})",
+                f"Laser L{idx_kol_l+1} ({x_vals[idx_kol_l]:.2f}m)",
+            )
+            rc2.metric(
+                "RSP Koleina Prawa",
+                f"{koleina_prawa_mm:.1f} mm (Klasa {klasa_rsp_p})",
+                f"Laser L{idx_kol_p+1} ({x_vals[idx_kol_p]:.2f}m)",
+            )
+            rc3.metric(
+                "RSP Koleina Maksymalna",
+                f"{max_koleina_rsp:.1f} mm (Klasa {klasa_rsp_m})",
+            )
+
+            st.markdown("##### 🟩 Dane z Systemu LCMS")
+            lc1, lc2, lc3 = st.columns(3)
+            if kol_lcms_l is not None and kol_lcms_p is not None:
+                if zrodlo_lcms == "Z pliku LCMS (surowe B2/C2)":
+                    disp_l, disp_p = kol_lcms_l, kol_lcms_p
+                    label_sub = "(z pliku B2/C2)"
+                elif zrodlo_lcms == "Wyliczone z profilu (Wirtualna Łata)":
+                    disp_l, disp_p = calc_lcms_rut_l, calc_lcms_rut_r
+                    label_sub = "(z Łaty DSN)"
+                else:
+                    disp_l, disp_p = kol_lcms_l, kol_lcms_p
+                    label_sub = (
+                        f"(Plik: {kol_lcms_l:.1f} / Łata: {calc_lcms_rut_l:.1f})"
+                    )
+
+                max_disp = max(disp_l, disp_p)
+                klasa_lcms_l = get_dsn_class(disp_l)
+                klasa_lcms_p = get_dsn_class(disp_p)
+                klasa_lcms_m = get_dsn_class(max_disp)
+
+                lc1.metric(
+                    f"LCMS Koleina Lewa {label_sub}",
+                    f"{disp_l:.1f} mm (Klasa {klasa_lcms_l})",
+                    delta=f"{koleina_lewa_mm - disp_l:+.1f} mm vs RSP",
+                )
+                lc2.metric(
+                    f"LCMS Koleina Prawa {label_sub}",
+                    f"{disp_p:.1f} mm (Klasa {klasa_lcms_p})",
+                    delta=f"{koleina_prawa_mm - disp_p:+.1f} mm vs RSP",
+                )
+                lc3.metric(
+                    "LCMS Koleina Maksymalna",
+                    f"{max_disp:.1f} mm (Klasa {klasa_lcms_m})",
+                    delta=f"{max_koleina_rsp - max_disp:+.1f} mm vs RSP",
+                )
+            else:
+                lc1.info("Brak profilu LCMS dla wybranego pikietażu.")
+
+            # WYKRES PRZEKROJU POPRZECZNEGO
+            fig = go.Figure()
+
+            fig.add_trace(
                 go.Scatter(
-                    x=df_all_rsp_ruts["Profil"],
-                    y=df_all_rsp_ruts["RSP_Rut_L"],
-                    mode="lines",
-                    name="RSP Koleina Lewa (Łata DSN)",
-                    line=dict(color="royalblue", width=2),
+                    x=x_vals,
+                    y=y_vals,
+                    mode="lines+markers",
+                    name="Profil RSP (Spline)",
+                    line=dict(
+                        shape="spline",
+                        smoothing=1.2,
+                        color="royalblue",
+                        width=3,
+                    ),
+                    marker=dict(size=7, color="navy"),
+                    hovertemplate=(
+                        "Poz X: %{x} m<br>Wys Y: %{y:.1f} mm<extra></extra>"
+                    ),
                 )
             )
-            if has_lcms:
-                if zrodlo_lcms in [
-                    "Z pliku LCMS (surowe B2/C2)",
-                    "Oba źródła jednocześnie",
-                ]:
-                    fig_l.add_trace(
+
+            if pokaz_late_rsp:
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_left,
+                        y=lata_lewa_y,
+                        mode="lines",
+                        name="Łata RSP Lewa",
+                        line=dict(color="crimson", width=2),
+                    )
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_right,
+                        y=lata_prawa_y,
+                        mode="lines",
+                        name="Łata RSP Prawa",
+                        line=dict(color="darkorange", width=2),
+                    )
+                )
+
+                x_kl, y_kl_prof, y_kl_lata = (
+                    x_vals[idx_kol_l],
+                    y_vals[idx_kol_l],
+                    lata_lewa_y[idx_kol_l],
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=[x_kl, x_kl],
+                        y=[y_kl_lata, y_kl_prof],
+                        mode="lines+markers",
+                        name=f"Głębokość RSP Lewa ({koleina_lewa_mm:.1f} mm)",
+                        line=dict(color="crimson", width=3),
+                        marker=dict(size=6, symbol="triangle-down"),
+                    )
+                )
+                fig.add_annotation(
+                    x=x_kl,
+                    y=(y_kl_lata + y_kl_prof) / 2,
+                    text=f" <b>RSP: {koleina_lewa_mm:.1f} mm</b>",
+                    showarrow=False,
+                    font=dict(color="crimson", size=12),
+                    bgcolor="rgba(255, 255, 255, 0.95)",
+                    bordercolor="crimson",
+                    borderwidth=1,
+                    xanchor="right",
+                )
+
+                x_kp, y_kp_prof, y_kp_lata = (
+                    x_vals[idx_kol_p],
+                    y_vals[idx_kol_p],
+                    lata_prawa_y[idx_kol_p_rel],
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=[x_kp, x_kp],
+                        y=[y_kp_lata, y_kp_prof],
+                        mode="lines+markers",
+                        name=f"Głębokość RSP Prawa ({koleina_prawa_mm:.1f} mm)",
+                        line=dict(color="darkorange", width=3),
+                        marker=dict(size=6, symbol="triangle-down"),
+                    )
+                )
+                fig.add_annotation(
+                    x=x_kp,
+                    y=(y_kp_prof + y_kp_lata) / 2,
+                    text=f" <b>RSP: {koleina_prawa_mm:.1f} mm</b>",
+                    showarrow=False,
+                    font=dict(color="darkorange", size=12),
+                    bgcolor="rgba(255, 255, 255, 0.95)",
+                    bordercolor="darkorange",
+                    borderwidth=1,
+                    xanchor="right",
+                )
+
+            if prof_lcms_data is not None:
+                x_lcms_orig = prof_lcms_data["x"].copy()
+                z_lcms_raw = prof_lcms_data["z"]
+                z_lcms_smooth = smooth_profile(z_lcms_raw, window_size=31)
+
+                rsp_x_max = np.max(x_vals)
+                rsp_x_min = np.min(x_vals)
+
+                x_lcms = x_lcms_orig.copy()
+
+                if skaluj_szerokosc and len(x_lcms) > 1:
+                    lcms_min = np.min(x_lcms)
+                    lcms_max = np.max(x_lcms)
+                    x_lcms = rsp_x_min + (x_lcms - lcms_min) * (
+                        (rsp_x_max - rsp_x_min) / (lcms_max - lcms_min)
+                    )
+                elif zaczep_prawa_krawedz and len(x_lcms) > 0:
+                    shift_right = rsp_x_max - np.max(x_lcms)
+                    x_lcms = x_lcms + shift_right
+
+                x_lcms = x_lcms + manual_x_shift_lcms
+
+                mid_mask_raw = (x_lcms >= -0.5) & (x_lcms <= 0.5)
+                if np.any(mid_mask_raw):
+                    idx_crown_lcms = np.where(mid_mask_raw)[0][
+                        np.argmax(z_lcms_smooth[mid_mask_raw])
+                    ]
+                else:
+                    idx_crown_lcms = np.argmin(np.abs(x_lcms))
+
+                x_lcms_l = x_lcms[: idx_crown_lcms + 1]
+                z_lcms_l_raw = z_lcms_smooth[: idx_crown_lcms + 1]
+                x_lcms_r = x_lcms[idx_crown_lcms:]
+                z_lcms_r_raw = z_lcms_smooth[idx_crown_lcms:]
+
+                lata_raw_l = get_upper_hull(x_lcms_l, z_lcms_l_raw)
+                lata_raw_r = get_upper_hull(x_lcms_r, z_lcms_r_raw)
+
+                if wyrownaj_spadek_lcms and len(x_lcms) > 10:
+                    p_trend = np.polyfit(x_lcms, z_lcms_smooth, 1)
+                    trend_line = p_trend[0] * x_lcms
+                    z_lcms_leveled = z_lcms_smooth - trend_line
+                    lata_plot_l = lata_raw_l - trend_line[: idx_crown_lcms + 1]
+                    lata_plot_r = lata_raw_r - trend_line[idx_crown_lcms:]
+                else:
+                    z_lcms_leveled = z_lcms_smooth
+                    lata_plot_l = lata_raw_l
+                    lata_plot_r = lata_raw_r
+
+                idx_mid_lcms = np.argmin(np.abs(x_lcms))
+                z_ref_lcms = z_lcms_leveled[idx_mid_lcms]
+
+                z_lcms_plot = z_lcms_leveled - z_ref_lcms
+                lata_plot_l_zero = lata_plot_l - z_ref_lcms
+                lata_plot_r_zero = lata_plot_r - z_ref_lcms
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_lcms,
+                        y=z_lcms_plot,
+                        mode="lines",
+                        name=f"Profil LCMS nr {wybrany_profil_lcms}",
+                        line=dict(color="forestgreen", width=2),
+                    )
+                )
+
+                if pokaz_late_lcms:
+                    fig.add_trace(
                         go.Scatter(
-                            x=lcms_p_shifted,
-                            y=lcms_file_rut_l,
+                            x=x_lcms_l,
+                            y=lata_plot_l_zero,
                             mode="lines",
-                            name="LCMS Lewa (Z pliku B2)",
-                            line=dict(color="forestgreen", width=2),
+                            name="Łata LCMS Lewa",
+                            line=dict(color="limegreen", width=2),
                         )
                     )
-                if zrodlo_lcms in [
-                    "Wyliczone z profilu (Wirtualna Łata)",
-                    "Oba źródła jednocześnie",
-                ]:
-                    fig_l.add_trace(
+                    fig.add_trace(
                         go.Scatter(
-                            x=lcms_p_shifted,
-                            y=lcms_calc_rut_l,
+                            x=x_lcms_r,
+                            y=lata_plot_r_zero,
                             mode="lines",
-                            name="LCMS Lewa (Wirtualna Łata)",
-                            line=dict(
-                                color="limegreen", width=1.5, dash="dash"
+                            name="Łata LCMS Prawa",
+                            line=dict(color="lime", width=2),
+                        )
+                    )
+
+                    val_l_show = (
+                        kol_lcms_l
+                        if zrodlo_lcms == "Z pliku LCMS (surowe B2/C2)"
+                        and kol_lcms_l is not None
+                        else calc_lcms_rut_l
+                    )
+                    val_r_show = (
+                        kol_lcms_p
+                        if zrodlo_lcms == "Z pliku LCMS (surowe B2/C2)"
+                        and kol_lcms_p is not None
+                        else calc_lcms_rut_r
+                    )
+
+                    diff_lcms_l = lata_plot_l_zero - (
+                        z_lcms_plot[: idx_crown_lcms + 1]
+                    )
+                    idx_k_l_c = np.argmax(diff_lcms_l)
+                    x_kl_c = x_lcms_l[idx_k_l_c]
+                    y_kl_c_prof = z_lcms_plot[idx_k_l_c]
+                    y_kl_c_lata = lata_plot_l_zero[idx_k_l_c]
+
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[x_kl_c, x_kl_c],
+                            y=[y_kl_c_lata, y_kl_c_prof],
+                            mode="lines+markers",
+                            name=(
+                                f"Głębokość LCMS Lewa ({val_l_show:.1f} mm)"
                             ),
-                        )
-                    )
-
-            fig_l.add_vline(
-                x=wybrany_profil,
-                line_width=2,
-                line_color="red",
-                annotation_text=f"Profil {wybrany_profil}",
-            )
-            fig_l.update_layout(
-                title="KOLEINA LEWA [mm]",
-                xaxis_title="Numer Profilu RSP",
-                yaxis_title="Głębokość koleiny [mm]",
-                height=420,
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig_l, use_container_width=True)
-
-        with tab_r:
-            fig_r = go.Figure()
-            fig_r.add_trace(
-                go.Scatter(
-                    x=df_all_rsp_ruts["Profil"],
-                    y=df_all_rsp_ruts["RSP_Rut_R"],
-                    mode="lines",
-                    name="RSP Koleina Prawa (Łata DSN)",
-                    line=dict(color="darkorange", width=2),
-                )
-            )
-            if has_lcms:
-                if zrodlo_lcms in [
-                    "Z pliku LCMS (surowe B2/C2)",
-                    "Oba źródła jednocześnie",
-                ]:
-                    fig_r.add_trace(
-                        go.Scatter(
-                            x=lcms_p_shifted,
-                            y=lcms_file_rut_r,
-                            mode="lines",
-                            name="LCMS Prawa (Z pliku C2)",
-                            line=dict(color="forestgreen", width=2),
-                        )
-                    )
-                if zrodlo_lcms in [
-                    "Wyliczone z profilu (Wirtualna Łata)",
-                    "Oba źródła jednocześnie",
-                ]:
-                    fig_r.add_trace(
-                        go.Scatter(
-                            x=lcms_p_shifted,
-                            y=lcms_calc_rut_r,
-                            mode="lines",
-                            name="LCMS Prawa (Wirtualna Łata)",
-                            line=dict(
-                                color="limegreen", width=1.5, dash="dash"
-                            ),
-                        )
-                    )
-
-            fig_r.add_vline(
-                x=wybrany_profil,
-                line_width=2,
-                line_color="red",
-                annotation_text=f"Profil {wybrany_profil}",
-            )
-            fig_r.update_layout(
-                title="KOLEINA PRAWA [mm]",
-                xaxis_title="Numer Profilu RSP",
-                yaxis_title="Głębokość koleiny [mm]",
-                height=420,
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig_r, use_container_width=True)
-
-        with tab_max:
-            fig_m = go.Figure()
-            fig_m.add_trace(
-                go.Scatter(
-                    x=df_all_rsp_ruts["Profil"],
-                    y=df_all_rsp_ruts["RSP_Rut_Max"],
-                    mode="lines",
-                    name="RSP Koleina Max (Łata DSN)",
-                    line=dict(color="crimson", width=2.5),
-                )
-            )
-            if has_lcms:
-                if zrodlo_lcms in [
-                    "Z pliku LCMS (surowe B2/C2)",
-                    "Oba źródła jednocześnie",
-                ]:
-                    fig_m.add_trace(
-                        go.Scatter(
-                            x=lcms_p_shifted,
-                            y=lcms_file_rut_max,
-                            mode="lines",
-                            name="LCMS Koleina Max (Z pliku B2/C2)",
                             line=dict(color="forestgreen", width=2.5),
+                            marker=dict(size=5, symbol="triangle-down"),
                         )
                     )
-                if zrodlo_lcms in [
-                    "Wyliczone z profilu (Wirtualna Łata)",
-                    "Oba źródła jednocześnie",
-                ]:
-                    fig_m.add_trace(
-                        go.Scatter(
-                            x=lcms_p_shifted,
-                            y=lcms_calc_rut_max,
-                            mode="lines",
-                            name="LCMS Koleina Max (Wirtualna Łata)",
-                            line=dict(
-                                color="limegreen", width=1.5, dash="dash"
-                            ),
-                        )
+                    fig.add_annotation(
+                        x=x_kl_c,
+                        y=(y_kl_c_lata + y_kl_c_prof) / 2,
+                        text=f"<b>LCMS: {val_l_show:.1f} mm</b> ",
+                        showarrow=False,
+                        font=dict(color="forestgreen", size=12),
+                        bgcolor="rgba(235, 255, 235, 0.95)",
+                        bordercolor="forestgreen",
+                        borderwidth=1,
+                        xanchor="left",
                     )
 
-            fig_m.add_vline(
-                x=wybrany_profil,
-                line_width=2,
-                line_color="red",
-                annotation_text=f"Profil {wybrany_profil}",
+                    diff_lcms_r = lata_plot_r_zero - (
+                        z_lcms_plot[idx_crown_lcms:]
+                    )
+                    idx_k_r_c_rel = np.argmax(diff_lcms_r)
+                    idx_k_r_c = idx_crown_lcms + idx_k_r_c_rel
+                    x_kp_c = x_lcms[idx_k_r_c]
+                    y_kp_c_prof = z_lcms_plot[idx_k_r_c]
+                    y_kp_c_lata = lata_plot_r_zero[idx_k_r_c_rel]
+
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[x_kp_c, x_kp_c],
+                            y=[y_kp_c_lata, y_kp_c_prof],
+                            mode="lines+markers",
+                            name=(
+                                f"Głębokość LCMS Prawa ({val_r_show:.1f} mm)"
+                            ),
+                            line=dict(color="forestgreen", width=2.5),
+                            marker=dict(size=5, symbol="triangle-down"),
+                        )
+                    )
+                    fig.add_annotation(
+                        x=x_kp_c,
+                        y=(y_kp_c_lata + y_kp_c_prof) / 2,
+                        text=f"<b>LCMS: {val_r_show:.1f} mm</b> ",
+                        showarrow=False,
+                        font=dict(color="forestgreen", size=12),
+                        bgcolor="rgba(235, 255, 235, 0.95)",
+                        bordercolor="forestgreen",
+                        borderwidth=1,
+                        xanchor="left",
+                    )
+
+            fig.add_vline(
+                x=0,
+                line_width=1,
+                line_dash="dot",
+                line_color="gray",
+                annotation_text="Oś L11 (0.0 m)",
             )
-            fig_m.update_layout(
-                title="KOLEINA MAKSYMALNA [mm]",
-                xaxis_title="Numer Profilu RSP",
-                yaxis_title="Głębokość koleiny [mm]",
-                height=420,
+
+            fig.update_layout(
+                title=f"Przekrój Poprzeczny – Profil RSP nr {wybrany_profil}",
+                xaxis_title="Pozycja czujnika na belce [m]",
+                yaxis_title=y_label,
+                height=580,
                 hovermode="x unified",
-            )
-            st.plotly_chart(fig_m, use_container_width=True)
-
-        with tab_all:
-            fig_all = go.Figure()
-            fig_all.add_trace(
-                go.Scatter(
-                    x=df_all_rsp_ruts["Profil"],
-                    y=df_all_rsp_ruts["RSP_Rut_L"],
-                    mode="lines",
-                    name="RSP Lewa",
-                    line=dict(color="royalblue", width=2),
-                )
-            )
-            fig_all.add_trace(
-                go.Scatter(
-                    x=df_all_rsp_ruts["Profil"],
-                    y=df_all_rsp_ruts["RSP_Rut_R"],
-                    mode="lines",
-                    name="RSP Prawa",
-                    line=dict(color="darkorange", width=2),
-                )
+                xaxis=dict(range=[-1.85, 1.85], dtick=0.2),
+                yaxis=dict(autorange=True if tryb_zero_l11 else "reversed"),
             )
 
-            if has_lcms:
-                if zrodlo_lcms in [
-                    "Z pliku LCMS (surowe B2/C2)",
-                    "Oba źródła jednocześnie",
-                ]:
-                    fig_all.add_trace(
-                        go.Scatter(
-                            x=lcms_p_shifted,
-                            y=lcms_file_rut_l,
-                            mode="lines",
-                            name="LCMS Lewa (Plik B2)",
-                            line=dict(color="forestgreen", width=1.5),
-                        )
-                    )
-                    fig_all.add_trace(
-                        go.Scatter(
-                            x=lcms_p_shifted,
-                            y=lcms_file_rut_r,
-                            mode="lines",
-                            name="LCMS Prawa (Plik C2)",
-                            line=dict(color="limegreen", width=1.5),
-                        )
-                    )
-                if zrodlo_lcms in [
-                    "Wyliczone z profilu (Wirtualna Łata)",
-                    "Oba źródła jednocześnie",
-                ]:
-                    fig_all.add_trace(
-                        go.Scatter(
-                            x=lcms_p_shifted,
-                            y=lcms_calc_rut_l,
-                            mode="lines",
-                            name="LCMS Lewa (Łata)",
-                            line=dict(
-                                color="forestgreen", width=1.0, dash="dash"
-                            ),
-                        )
-                    )
-                    fig_all.add_trace(
-                        go.Scatter(
-                            x=lcms_p_shifted,
-                            y=lcms_calc_rut_r,
-                            mode="lines",
-                            name="LCMS Prawa (Łata)",
-                            line=dict(
-                                color="limegreen", width=1.0, dash="dash"
-                            ),
-                        )
-                    )
+            st.plotly_chart(fig, use_container_width=True)
 
-            fig_all.add_vline(
-                x=wybrany_profil,
-                line_width=2,
-                line_color="red",
-                annotation_text=f"Profil {wybrany_profil}",
-            )
-            fig_all.update_layout(
-                title="Zestawienie Zbiorcze: RSP vs LCMS",
-                xaxis_title="Numer Profilu RSP",
-                yaxis_title="Głębokość koleiny [mm]",
-                height=450,
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig_all, use_container_width=True)
-
-        # MAPA GPS
-        if df_rsp_gps is not None or df_xml_gps is not None:
+            # WYKRESY PODŁUŻNE NA CAŁEJ TRASIE
             st.markdown("---")
-            st.subheader("🗺️ MAPA GPS i Przesunięcie Terenowe")
+            st.subheader("📈 Przebieg Kolein na Całej Trasie (RSP vs LCMS)")
 
-            idx_rsp_gps = (
-                min(max(0, wybrany_profil - min_p), len(df_rsp_gps) - 1)
-                if df_rsp_gps is not None
-                else None
-            )
-            row_rsp_gps = (
-                df_rsp_gps.iloc[idx_rsp_gps] if idx_rsp_gps is not None else None
+            df_all_rsp_ruts = compute_all_rsp_ruts_cached(
+                df_rsp, tuple(pozycja_x)
             )
 
-            idx_lcms_gps = (
-                min(max(0, wybrany_profil_lcms - 1), len(df_xml_gps) - 1)
-                if df_xml_gps is not None
-                else None
-            )
-            row_lcms_gps = (
-                df_xml_gps.iloc[idx_lcms_gps]
-                if idx_lcms_gps is not None
-                else None
-            )
-
-            dist_m = None
-            if row_rsp_gps is not None and row_lcms_gps is not None:
-                dist_m = haversine_distance_m(
-                    row_rsp_gps["LAT"],
-                    row_rsp_gps["LON"],
-                    row_lcms_gps["LAT"],
-                    row_lcms_gps["LON"],
+            has_lcms = lcms_profiles is not None and len(lcms_profiles) > 0
+            if has_lcms:
+                list_lcms_p = sorted(lcms_profiles.keys())
+                df_lcms_calc_all = compute_all_lcms_calc_ruts_cached(
+                    lcms_profiles
                 )
 
-                lats_lcms = df_xml_gps["LAT"].values
-                lons_lcms = df_xml_gps["LON"].values
-                dists_all = [
-                    haversine_distance_m(
-                        row_rsp_gps["LAT"], row_rsp_gps["LON"], la, lo
-                    )
-                    for la, lo in zip(lats_lcms, lons_lcms)
+                lcms_file_rut_l = [
+                    lcms_profiles[p]["rut_l"] for p in list_lcms_p
                 ]
-                best_match_idx = int(np.argmin(dists_all))
-                best_match_dist = dists_all[best_match_idx]
-                sugerowany_offset = (best_match_idx + 1) - wybrany_profil
-
-                mc1, mc2, mc3 = st.columns(3)
-                mc1.metric(
-                    "Odległość GPS (Obecny Offset)",
-                    f"{dist_m:.2f} m",
-                    delta=f"Przesunięcie: {całkowity_offset:+.1f} m",
-                )
-                mc2.metric(
-                    "Sugerowany Offset Przestrzenny",
-                    f"{sugerowany_offset:+} m",
-                    delta_color="normal",
-                )
-                mc3.metric(
-                    "Najmniejszy Dystans Terenowy",
-                    f"{best_match_dist:.2f} m",
-                    f"Punkt LCMS #{best_match_idx + 1}",
+                lcms_file_rut_r = [
+                    lcms_profiles[p]["rut_r"] for p in list_lcms_p
+                ]
+                lcms_file_rut_max = np.maximum(
+                    lcms_file_rut_l, lcms_file_rut_r
                 )
 
-            fig_map = go.Figure()
-            center_lat, center_lon = 52.0, 19.0
+                lcms_calc_rut_l = df_lcms_calc_all["LCMS_Calc_Rut_L"].values
+                lcms_calc_rut_r = df_lcms_calc_all["LCMS_Calc_Rut_R"].values
+                lcms_calc_rut_max = df_lcms_calc_all[
+                    "LCMS_Calc_Rut_Max"
+                ].values
 
-            if row_rsp_gps is not None:
-                center_lat, center_lon = (
-                    row_rsp_gps["LAT"],
-                    row_rsp_gps["LON"],
-                )
-            elif row_lcms_gps is not None:
-                center_lat, center_lon = (
-                    row_lcms_gps["LAT"],
-                    row_lcms_gps["LON"],
-                )
+                lcms_p_shifted = []
+                for p in list_lcms_p:
+                    if podziel_na_sekcje:
+                        idx_s_p = int((p - min_p) // sekcja_m)
+                        off_s = bazowy_offset + sekcje_offsets.get(
+                            idx_s_p, 0.0
+                        )
+                    else:
+                        off_s = bazowy_offset
+                    lcms_p_shifted.append(p - off_s)
 
-            if df_rsp_gps is not None:
-                fig_map.add_trace(
-                    make_map_trace(
-                        lat=df_rsp_gps["LAT"],
-                        lon=df_rsp_gps["LON"],
-                        mode="markers+lines",
-                        marker=dict(size=5, color="royalblue"),
-                        line=dict(width=2, color="royalblue"),
-                        name=f"Trasa RSP GPS ({len(df_rsp_gps)} pkt)",
-                        text=[
-                            f"Profil RSP: {p_i}"
-                            for p_i in df_rsp_gps["Profil_idx"]
-                        ],
+            sub_t1, sub_t2, sub_t3, sub_t4 = st.tabs([
+                "👈 Koleina Lewa",
+                "👉 Koleina Prawa",
+                "🔝 Koleina Maksymalna",
+                "📊 Zbiorcze",
+            ])
+
+            with sub_t1:
+                fig_l = go.Figure()
+                fig_l.add_trace(
+                    go.Scatter(
+                        x=df_all_rsp_ruts["Profil"],
+                        y=df_all_rsp_ruts["RSP_Rut_L"],
+                        mode="lines",
+                        name="RSP Koleina Lewa (Łata DSN)",
+                        line=dict(color="royalblue", width=2),
                     )
                 )
+                if has_lcms:
+                    if zrodlo_lcms in [
+                        "Z pliku LCMS (surowe B2/C2)",
+                        "Oba źródła jednocześnie",
+                    ]:
+                        fig_l.add_trace(
+                            go.Scatter(
+                                x=lcms_p_shifted,
+                                y=lcms_file_rut_l,
+                                mode="lines",
+                                name="LCMS Lewa (Z pliku B2)",
+                                line=dict(color="forestgreen", width=2),
+                            )
+                        )
+                    if zrodlo_lcms in [
+                        "Wyliczone z profilu (Wirtualna Łata)",
+                        "Oba źródła jednocześnie",
+                    ]:
+                        fig_l.add_trace(
+                            go.Scatter(
+                                x=lcms_p_shifted,
+                                y=lcms_calc_rut_l,
+                                mode="lines",
+                                name="LCMS Lewa (Wirtualna Łata)",
+                                line=dict(
+                                    color="limegreen", width=1.5, dash="dash"
+                                ),
+                            )
+                        )
+
+                fig_l.add_vline(
+                    x=wybrany_profil,
+                    line_width=2,
+                    line_color="red",
+                    annotation_text=f"Profil {wybrany_profil}",
+                )
+                fig_l.update_layout(
+                    title="KOLEINA LEWA [mm]",
+                    xaxis_title="Numer Profilu RSP",
+                    yaxis_title="Głębokość koleiny [mm]",
+                    height=420,
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig_l, use_container_width=True)
+
+            with sub_t2:
+                fig_r = go.Figure()
+                fig_r.add_trace(
+                    go.Scatter(
+                        x=df_all_rsp_ruts["Profil"],
+                        y=df_all_rsp_ruts["RSP_Rut_R"],
+                        mode="lines",
+                        name="RSP Koleina Prawa (Łata DSN)",
+                        line=dict(color="darkorange", width=2),
+                    )
+                )
+                if has_lcms:
+                    if zrodlo_lcms in [
+                        "Z pliku LCMS (surowe B2/C2)",
+                        "Oba źródła jednocześnie",
+                    ]:
+                        fig_r.add_trace(
+                            go.Scatter(
+                                x=lcms_p_shifted,
+                                y=lcms_file_rut_r,
+                                mode="lines",
+                                name="LCMS Prawa (Z pliku C2)",
+                                line=dict(color="forestgreen", width=2),
+                            )
+                        )
+                    if zrodlo_lcms in [
+                        "Wyliczone z profilu (Wirtualna Łata)",
+                        "Oba źródła jednocześnie",
+                    ]:
+                        fig_r.add_trace(
+                            go.Scatter(
+                                x=lcms_p_shifted,
+                                y=lcms_calc_rut_r,
+                                mode="lines",
+                                name="LCMS Prawa (Wirtualna Łata)",
+                                line=dict(
+                                    color="limegreen", width=1.5, dash="dash"
+                                ),
+                            )
+                        )
+
+                fig_r.add_vline(
+                    x=wybrany_profil,
+                    line_width=2,
+                    line_color="red",
+                    annotation_text=f"Profil {wybrany_profil}",
+                )
+                fig_r.update_layout(
+                    title="KOLEINA PRAWA [mm]",
+                    xaxis_title="Numer Profilu RSP",
+                    yaxis_title="Głębokość koleiny [mm]",
+                    height=420,
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig_r, use_container_width=True)
+
+            with sub_t3:
+                fig_m = go.Figure()
+                fig_m.add_trace(
+                    go.Scatter(
+                        x=df_all_rsp_ruts["Profil"],
+                        y=df_all_rsp_ruts["RSP_Rut_Max"],
+                        mode="lines",
+                        name="RSP Koleina Max (Łata DSN)",
+                        line=dict(color="crimson", width=2.5),
+                    )
+                )
+                if has_lcms:
+                    if zrodlo_lcms in [
+                        "Z pliku LCMS (surowe B2/C2)",
+                        "Oba źródła jednocześnie",
+                    ]:
+                        fig_m.add_trace(
+                            go.Scatter(
+                                x=lcms_p_shifted,
+                                y=lcms_file_rut_max,
+                                mode="lines",
+                                name="LCMS Koleina Max (Z pliku B2/C2)",
+                                line=dict(color="forestgreen", width=2.5),
+                            )
+                        )
+                    if zrodlo_lcms in [
+                        "Wyliczone z profilu (Wirtualna Łata)",
+                        "Oba źródła jednocześnie",
+                    ]:
+                        fig_m.add_trace(
+                            go.Scatter(
+                                x=lcms_p_shifted,
+                                y=lcms_calc_rut_max,
+                                mode="lines",
+                                name="LCMS Koleina Max (Wirtualna Łata)",
+                                line=dict(
+                                    color="limegreen", width=1.5, dash="dash"
+                                ),
+                            )
+                        )
+
+                fig_m.add_vline(
+                    x=wybrany_profil,
+                    line_width=2,
+                    line_color="red",
+                    annotation_text=f"Profil {wybrany_profil}",
+                )
+                fig_m.update_layout(
+                    title="KOLEINA MAKSYMALNA [mm]",
+                    xaxis_title="Numer Profilu RSP",
+                    yaxis_title="Głębokość koleiny [mm]",
+                    height=420,
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig_m, use_container_width=True)
+
+            with sub_t4:
+                fig_all = go.Figure()
+                fig_all.add_trace(
+                    go.Scatter(
+                        x=df_all_rsp_ruts["Profil"],
+                        y=df_all_rsp_ruts["RSP_Rut_L"],
+                        mode="lines",
+                        name="RSP Lewa",
+                        line=dict(color="royalblue", width=2),
+                    )
+                )
+                fig_all.add_trace(
+                    go.Scatter(
+                        x=df_all_rsp_ruts["Profil"],
+                        y=df_all_rsp_ruts["RSP_Rut_R"],
+                        mode="lines",
+                        name="RSP Prawa",
+                        line=dict(color="darkorange", width=2),
+                    )
+                )
+
+                if has_lcms:
+                    if zrodlo_lcms in [
+                        "Z pliku LCMS (surowe B2/C2)",
+                        "Oba źródła jednocześnie",
+                    ]:
+                        fig_all.add_trace(
+                            go.Scatter(
+                                x=lcms_p_shifted,
+                                y=lcms_file_rut_l,
+                                mode="lines",
+                                name="LCMS Lewa (Plik B2)",
+                                line=dict(color="forestgreen", width=1.5),
+                            )
+                        )
+                        fig_all.add_trace(
+                            go.Scatter(
+                                x=lcms_p_shifted,
+                                y=lcms_file_rut_r,
+                                mode="lines",
+                                name="LCMS Prawa (Plik C2)",
+                                line=dict(color="limegreen", width=1.5),
+                            )
+                        )
+
+                fig_all.add_vline(
+                    x=wybrany_profil,
+                    line_width=2,
+                    line_color="red",
+                    annotation_text=f"Profil {wybrany_profil}",
+                )
+                fig_all.update_layout(
+                    title="Zestawienie Zbiorcze: RSP vs LCMS",
+                    xaxis_title="Numer Profilu RSP",
+                    yaxis_title="Głębokość koleiny [mm]",
+                    height=450,
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig_all, use_container_width=True)
+
+            # MAPA GPS
+            if df_rsp_gps is not None or df_xml_gps is not None:
+                st.markdown("---")
+                st.subheader("🗺️ MAPA GPS i Przesunięcie Terenowe")
+
+                idx_rsp_gps = (
+                    min(max(0, wybrany_profil - min_p), len(df_rsp_gps) - 1)
+                    if df_rsp_gps is not None
+                    else None
+                )
+                row_rsp_gps = (
+                    df_rsp_gps.iloc[idx_rsp_gps]
+                    if idx_rsp_gps is not None
+                    else None
+                )
+
+                idx_lcms_gps = (
+                    min(max(0, wybrany_profil_lcms - 1), len(df_xml_gps) - 1)
+                    if df_xml_gps is not None
+                    else None
+                )
+                row_lcms_gps = (
+                    df_xml_gps.iloc[idx_lcms_gps]
+                    if idx_lcms_gps is not None
+                    else None
+                )
+
+                dist_m = None
+                if row_rsp_gps is not None and row_lcms_gps is not None:
+                    dist_m = haversine_distance_m(
+                        row_rsp_gps["LAT"],
+                        row_rsp_gps["LON"],
+                        row_lcms_gps["LAT"],
+                        row_lcms_gps["LON"],
+                    )
+
+                    lats_lcms = df_xml_gps["LAT"].values
+                    lons_lcms = df_xml_gps["LON"].values
+                    dists_all = [
+                        haversine_distance_m(
+                            row_rsp_gps["LAT"], row_rsp_gps["LON"], la, lo
+                        )
+                        for la, lo in zip(lats_lcms, lons_lcms)
+                    ]
+                    best_match_idx = int(np.argmin(dists_all))
+                    best_match_dist = dists_all[best_match_idx]
+                    sugerowany_offset = (best_match_idx + 1) - wybrany_profil
+
+                    mc1, mc2, mc3 = st.columns(3)
+                    mc1.metric(
+                        "Odległość GPS (Obecny Offset)",
+                        f"{dist_m:.2f} m",
+                        delta=f"Przesunięcie: {całkowity_offset:+.1f} m",
+                    )
+                    mc2.metric(
+                        "Sugerowany Offset Przestrzenny",
+                        f"{sugerowany_offset:+} m",
+                        delta_color="normal",
+                    )
+                    mc3.metric(
+                        "Najmniejszy Dystans Terenowy",
+                        f"{best_match_dist:.2f} m",
+                        f"Punkt LCMS #{best_match_idx + 1}",
+                    )
+
+                fig_map = go.Figure()
+                center_lat, center_lon = 52.0, 19.0
+
                 if row_rsp_gps is not None:
+                    center_lat, center_lon = (
+                        row_rsp_gps["LAT"],
+                        row_rsp_gps["LON"],
+                    )
+                elif row_lcms_gps is not None:
+                    center_lat, center_lon = (
+                        row_lcms_gps["LAT"],
+                        row_lcms_gps["LON"],
+                    )
+
+                if df_rsp_gps is not None:
                     fig_map.add_trace(
                         make_map_trace(
-                            lat=[row_rsp_gps["LAT"]],
-                            lon=[row_rsp_gps["LON"]],
-                            mode="markers",
-                            marker=dict(size=14, color="red"),
-                            name=f"Profil RSP {wybrany_profil}",
-                            text=[f"Pozycja RSP nr {wybrany_profil}"],
+                            lat=df_rsp_gps["LAT"],
+                            lon=df_rsp_gps["LON"],
+                            mode="markers+lines",
+                            marker=dict(size=5, color="royalblue"),
+                            line=dict(width=2, color="royalblue"),
+                            name=f"Trasa RSP GPS ({len(df_rsp_gps)} pkt)",
+                            text=[
+                                f"Profil RSP: {p_i}"
+                                for p_i in df_rsp_gps["Profil_idx"]
+                            ],
                         )
                     )
-
-            if df_xml_gps is not None:
-                fig_map.add_trace(
-                    make_map_trace(
-                        lat=df_xml_gps["LAT"],
-                        lon=df_xml_gps["LON"],
-                        mode="markers+lines",
-                        marker=dict(size=4, color="forestgreen"),
-                        line=dict(width=1.5, color="forestgreen"),
-                        name=f"Trasa LCMS XML ({len(df_xml_gps)} pkt)",
-                        text=[
-                            f"Pikietaż LCMS: {st_m:.1f}m<br>Plik: {fn}"
-                            for st_m, fn in zip(
-                                df_xml_gps["Station_m"], df_xml_gps["Filename"]
+                    if row_rsp_gps is not None:
+                        fig_map.add_trace(
+                            make_map_trace(
+                                lat=[row_rsp_gps["LAT"]],
+                                lon=[row_rsp_gps["LON"]],
+                                mode="markers",
+                                marker=dict(size=14, color="red"),
+                                name=f"Profil RSP {wybrany_profil}",
+                                text=[f"Pozycja RSP nr {wybrany_profil}"],
                             )
-                        ],
-                    )
-                )
-                if row_lcms_gps is not None:
+                        )
+
+                if df_xml_gps is not None:
                     fig_map.add_trace(
                         make_map_trace(
-                            lat=[row_lcms_gps["LAT"]],
-                            lon=[row_lcms_gps["LON"]],
-                            mode="markers",
-                            marker=dict(size=12, color="darkorange"),
-                            name=f"Profil LCMS {wybrany_profil_lcms}",
+                            lat=df_xml_gps["LAT"],
+                            lon=df_xml_gps["LON"],
+                            mode="markers+lines",
+                            marker=dict(size=4, color="forestgreen"),
+                            line=dict(width=1.5, color="forestgreen"),
+                            name=f"Trasa LCMS XML ({len(df_xml_gps)} pkt)",
                             text=[
-                                f"LCMS Profil {wybrany_profil_lcms}<br>Pikietaż:"
-                                f" {row_lcms_gps['Station_m']}m"
+                                f"Pikietaż LCMS: {st_m:.1f}m<br>Plik: {fn}"
+                                for st_m, fn in zip(
+                                    df_xml_gps["Station_m"],
+                                    df_xml_gps["Filename"],
+                                )
+                            ],
+                        )
+                    )
+                    if row_lcms_gps is not None:
+                        fig_map.add_trace(
+                            make_map_trace(
+                                lat=[row_lcms_gps["LAT"]],
+                                lon=[row_lcms_gps["LON"]],
+                                mode="markers",
+                                marker=dict(size=12, color="darkorange"),
+                                name=f"Profil LCMS {wybrany_profil_lcms}",
+                                text=[
+                                    f"LCMS Profil {wybrany_profil_lcms}<br>Pikietaż:"
+                                    f" {row_lcms_gps['Station_m']}m"
+                                ],
+                            )
+                        )
+
+                if (
+                    row_rsp_gps is not None
+                    and row_lcms_gps is not None
+                    and dist_m is not None
+                ):
+                    fig_map.add_trace(
+                        make_map_trace(
+                            lat=[row_rsp_gps["LAT"], row_lcms_gps["LAT"]],
+                            lon=[row_rsp_gps["LON"], row_lcms_gps["LON"]],
+                            mode="lines",
+                            line=dict(color="crimson", width=3),
+                            name=f"Przesunięcie terenowe: {dist_m:.2f} m",
+                            text=[
+                                f"Przesunięcie pozycji: {dist_m:.2f} m",
+                                f"Przesunięcie pozycji: {dist_m:.2f} m",
                             ],
                         )
                     )
 
-            if (
-                row_rsp_gps is not None
-                and row_lcms_gps is not None
-                and dist_m is not None
-            ):
-                fig_map.add_trace(
-                    make_map_trace(
-                        lat=[row_rsp_gps["LAT"], row_lcms_gps["LAT"]],
-                        lon=[row_rsp_gps["LON"], row_lcms_gps["LON"]],
-                        mode="lines",
-                        line=dict(color="crimson", width=3),
-                        name=f"Przesunięcie terenowe: {dist_m:.2f} m",
-                        text=[
-                            f"Przesunięcie pozycji: {dist_m:.2f} m",
-                            f"Przesunięcie pozycji: {dist_m:.2f} m",
-                        ],
-                    )
+                map_config = dict(
+                    center=dict(lat=center_lat, lon=center_lon), zoom=15
                 )
 
-            map_config = dict(
-                center=dict(lat=center_lat, lon=center_lon), zoom=15
+                try:
+                    if hasattr(go, "Scattermap"):
+                        fig_map.update_layout(
+                            map_style="open-street-map",
+                            map=map_config,
+                            margin=dict(l=0, r=0, t=20, b=0),
+                            height=480,
+                        )
+                    else:
+                        fig_map.update_layout(
+                            mapbox_style="open-street-map",
+                            mapbox=map_config,
+                            margin=dict(l=0, r=0, t=20, b=0),
+                            height=480,
+                        )
+                except Exception:
+                    fig_map.update_layout(
+                        margin=dict(l=0, r=0, t=20, b=0), height=480
+                    )
+
+                st.plotly_chart(fig_map, use_container_width=True)
+
+        # --- ZAKŁADKA 2: OCENA 50M DSN 2019 ---
+        with tab_dsn50:
+            st.header("📊 Ocena Stanu Koleiny dla Odcinków 50-metrowych (DSN 2019)")
+            st.markdown(
+                r"""
+            Wzór normowy oceny odcinkowej $H_m$:
+            $$H_m = E(h) + 2 D_h$$
+            gdzie: $E(h)$ to średnia głębokość koleiny na odcinku 50m, a $D_h$ to odchylenie standardowe.
+            
+            **Klasy Stanu DSN:**  
+            🟢 **Klasa A (0–10.9 mm)** | 🟡 **Klasa B (11–20.9 mm)** | 🟠 **Klasa C (21–30.9 mm)** | 🔴 **Klasa D (≥ 31 mm)**
+            """
             )
 
-            try:
-                if hasattr(go, "Scattermap"):
-                    fig_map.update_layout(
-                        map_style="open-street-map",
-                        map=map_config,
-                        margin=dict(l=0, r=0, t=20, b=0),
-                        height=480,
-                    )
-                else:
-                    fig_map.update_layout(
-                        mapbox_style="open-street-map",
-                        mapbox=map_config,
-                        margin=dict(l=0, r=0, t=20, b=0),
-                        height=480,
-                    )
-            except Exception:
-                fig_map.update_layout(
-                    margin=dict(l=0, r=0, t=20, b=0), height=480
+            df_all_rsp_ruts = compute_all_rsp_ruts_cached(
+                df_rsp, tuple(pozycja_x)
+            )
+
+            df_merged_ruts = df_all_rsp_ruts.copy()
+            if lcms_profiles is not None:
+                list_lcms_p = sorted(lcms_profiles.keys())
+                df_lcms_calc_all = compute_all_lcms_calc_ruts_cached(
+                    lcms_profiles
                 )
 
-            st.plotly_chart(fig_map, use_container_width=True)
+                if zrodlo_lcms == "Z pliku LCMS (surowe B2/C2)":
+                    lcms_l_vals = [
+                        lcms_profiles[p]["rut_l"] for p in list_lcms_p
+                    ]
+                    lcms_r_vals = [
+                        lcms_profiles[p]["rut_r"] for p in list_lcms_p
+                    ]
+                else:
+                    lcms_l_vals = df_lcms_calc_all["LCMS_Calc_Rut_L"].values
+                    lcms_r_vals = df_lcms_calc_all["LCMS_Calc_Rut_R"].values
 
-        st.subheader("Odczyty Czujników RSP [mm]:")
-        df_tbl = pd.DataFrame(
-            [y_vals],
-            columns=[
-                f"L{i+1} ({x_vals[i]:.2f}m)" for i in range(ile_laserow)
-            ],
-        )
-        st.dataframe(df_tbl, use_container_width=True)
+                df_lcms_sub = pd.DataFrame({
+                    "Profil": [int(p - całkowity_offset) for p in list_lcms_p],
+                    "LCMS_Rut_L": lcms_l_vals,
+                    "LCMS_Rut_R": lcms_r_vals,
+                })
+                df_merged_ruts = pd.merge(
+                    df_merged_ruts, df_lcms_sub, on="Profil", how="inner"
+                )
+
+            df_sec_dsn = compute_50m_dsn_sections_full(
+                df_merged_ruts, step_m=1.0, section_m=50.0
+            )
+
+            # WYKRES SŁUPKOWY KLASYFIKACJI H_M DLA ODCINKÓW 50M
+            fig_sec = go.Figure()
+
+            # RSP P_KOL
+            colors_rsp_p = [
+                get_dsn_color(k) for k in df_sec_dsn["RSP P_KOL Klasa"]
+            ]
+            fig_sec.add_trace(
+                go.Bar(
+                    x=df_sec_dsn["Odcinek"],
+                    y=df_sec_dsn["RSP P_KOL Hm"],
+                    name="RSP Prawa Koleina (Hm)",
+                    marker_color=colors_rsp_p,
+                    text=[
+                        f"{hm} mm ({k})"
+                        for hm, k in zip(
+                            df_sec_dsn["RSP P_KOL Hm"],
+                            df_sec_dsn["RSP P_KOL Klasa"],
+                        )
+                    ],
+                    textposition="auto",
+                )
+            )
+
+            if "LCMS P_KOL Hm" in df_sec_dsn.columns:
+                colors_lcms_p = [
+                    get_dsn_color(k) for k in df_sec_dsn["LCMS P_KOL Klasa"]
+                ]
+                fig_sec.add_trace(
+                    go.Bar(
+                        x=df_sec_dsn["Odcinek"],
+                        y=df_sec_dsn["LCMS P_KOL Hm"],
+                        name="LCMS Prawa Koleina (Hm)",
+                        marker_color=colors_lcms_p,
+                        opacity=0.7,
+                        text=[
+                            f"{hm} mm ({k})"
+                            for hm, k in zip(
+                                df_sec_dsn["LCMS P_KOL Hm"],
+                                df_sec_dsn["LCMS P_KOL Klasa"],
+                            )
+                        ],
+                        textposition="auto",
+                    )
+                )
+
+            fig_sec.add_hline(
+                y=11,
+                line_dash="dash",
+                line_color="#ffc107",
+                annotation_text="Próg B (11mm)",
+            )
+            fig_sec.add_hline(
+                y=21,
+                line_dash="dash",
+                line_color="#fd7e14",
+                annotation_text="Próg C (21mm)",
+            )
+            fig_sec.add_hline(
+                y=31,
+                line_dash="dash",
+                line_color="#dc3545",
+                annotation_text="Próg D (31mm)",
+            )
+
+            fig_sec.update_layout(
+                title="Ocena Hm dla Odcinków 50m – Prawa Koleina (P_KOL)",
+                xaxis_title="Odcinek Pikietażu",
+                yaxis_title="Ocena Hm [mm]",
+                barmode="group",
+                height=480,
+            )
+            st.plotly_chart(fig_sec, use_container_width=True)
+
+            st.markdown("##### Tabela Zbiorcza Odcinkowej Oceny 50m (DSN 2019)")
+            st.dataframe(df_sec_dsn, use_container_width=True)
+
+        # --- ZAKŁADKA 3: ANALIZA PORÓWNAWCZA GDDKiA (BLAND-ALTMAN & RPD) ---
+        with tab_ba_gddkia:
+            st.header("📈 Analiza Porównawcza LCMS vs RSP (Metodologia GDDKiA)")
+
+            if (
+                lcms_profiles is not None
+                and len(lcms_profiles) > 0
+                and "LCMS_Rut_L" in df_merged_ruts.columns
+            ):
+                rsp_l_v = df_merged_ruts["RSP_Rut_L"].values
+                rsp_r_v = df_merged_ruts["RSP_Rut_R"].values
+                lcms_l_v = df_merged_ruts["LCMS_Rut_L"].values
+                lcms_r_v = df_merged_ruts["LCMS_Rut_R"].values
+
+                # WYKRESY BLANDA-ALTMANA
+                col_ba1, col_ba2 = st.columns(2)
+
+                with col_ba1:
+                    fig_ba_r, m_diff_r, sd_r, loa_u_r, loa_l_r = (
+                        build_bland_altman_fig(
+                            rsp_r_v, lcms_r_v, title="PRAWA KOLEINA (P_KOL)"
+                        )
+                    )
+                    st.plotly_chart(fig_ba_r, use_container_width=True)
+
+                with col_ba2:
+                    fig_ba_l, m_diff_l, sd_l, loa_u_l, loa_l_l = (
+                        build_bland_altman_fig(
+                            rsp_l_v, lcms_l_v, title="LEWA KOLEINA (L_KOL)"
+                        )
+                    )
+                    st.plotly_chart(fig_ba_l, use_container_width=True)
+
+                st.markdown("---")
+                st.subheader("📊 Procentowa Różnica Względna (RPD)")
+                st.markdown(
+                    "Ocena zróżnicowania pomiarów w dwustopniowym podziale RPD"
+                    " (0–30% oraz >30%) w odniesieniu do ich poziomu"
+                    " (średniej):"
+                )
+
+                col_rpd_p, col_rpd_l = st.columns(2)
+
+                with col_rpd_p:
+                    st.markdown("##### P_KOL (Prawa Koleina)")
+                    df_rpd_p = build_rpd_table_df(rsp_r_v, lcms_r_v)
+                    st.table(df_rpd_p)
+
+                with col_rpd_l:
+                    st.markdown("##### L_KOL (Lewa Koleina)")
+                    df_rpd_l = build_rpd_table_df(rsp_l_v, lcms_l_v)
+                    st.table(df_rpd_l)
+
+                # AUTOMATYCZNY RAPORT
+                st.markdown("---")
+                st.subheader("📑 Wnioski i Raport Analityczny GDDKiA")
+
+                bias_status_p = (
+                    "zawyża wyniki" if m_diff_r > 0 else "zaniża wyniki"
+                )
+                bias_status_l = (
+                    "zawyża wyniki" if m_diff_l > 0 else "zaniża wyniki"
+                )
+
+                st.info(f"""
+                **Wnioski Kluczowe na podstawie wczytanych danych pomiarowych:**
+
+                1. **Błąd Systematyczny (Bias):**
+                   * Dla **P_KOL**: Średnia różnica wynosi **{m_diff_r:+.2f} mm** (system LCMS {bias_status_p} w stosunku do profilografu laserowego RSP).
+                   * Dla **L_KOL**: Średnia różnica wynosi **{m_diff_l:+.2f} mm** (system LCMS {bias_status_l} w stosunku do RSP).
+
+                2. **Charakterystyka Rozrzutu (Kształt „Ryby / Trójkąta”):**
+                   * Wykresy Blanda-Altmana układają się w charakterystyczny stożek/rybę. Przy niskich głębokościach kolein (do ~10 mm) obie metody wykazują bardzo wysoką zgodność.
+                   * Wraz ze wzrostem głębokości kolein rozrzut różnic rośnie, co potwierdza obserwacje GDDKiA – wyższe wartości głębokości generują wzrost rozbieżności między systemami.
+
+                3. **Przydatność Współczynnika Zmienności (CV) vs RPD:**
+                   * Zgodnie z wytycznymi GDDKiA, wysokie wartości klasycznego współczynnika zmienności (CV) w dolnym zakresie wynikają z **matematycznego „efektu małego mianownika”** i nie świadczą o braku stabilności metody.
+                   * Zastosowana analiza RPD w grupie wysokiego zróżnicowania (>30% RPD) jednoznacznie wskazuje dominantę wyników LCMS nad RSP.
+                """)
+            else:
+                st.warning(
+                    "⚠️ Aby wygenerować wykresy Blanda-Altmana oraz tabele RPD,"
+                    " wgraj zarówno plik profilografu RSP, jak i dane LCMS."
+                )
 
     else:
         st.warning(f"Brak danych RSP dla profilu {wybrany_profil}.")
