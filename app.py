@@ -246,104 +246,79 @@ def parse_rsp_gps_cached(file_bytes, file_name):
 
 @st.cache_data
 def parse_lcms_raw_cached(file_bytes, file_name):
-    """Parser surowych plików LCMS DSN (.csv oraz .xlsx)."""
-    if file_name.lower().endswith(".csv"):
-        try:
-            df_lcms_raw = pd.read_csv(
-                io.BytesIO(file_bytes), header=None, sep=";", engine="python"
-            )
-        except Exception:
-            df_lcms_raw = pd.read_csv(
-                io.BytesIO(file_bytes), header=None, sep=None, engine="python"
-            )
+    """Pancerny parser plików LCMS z obsługą surowego CSV linia po linii."""
+    if file_name.lower().endswith(".xlsx") or file_name.lower().endswith(".xls"):
+        df_excel = pd.read_excel(io.BytesIO(file_bytes), header=None)
+        raw_rows = []
+        for _, r in df_excel.iterrows():
+            raw_rows.append([
+                str(v).replace(",", ".").strip() if pd.notna(v) else ""
+                for v in r.values
+            ])
     else:
-        df_lcms_raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
+        text = file_bytes.decode("utf-8", errors="ignore")
+        lines = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
+        first_line = lines[0] if lines else ""
+        sep = ";" if ";" in first_line else ("," if "," in first_line else "\t")
+        raw_rows = []
+        for line in lines:
+            parts = [p.strip().replace(",", ".") for p in line.split(sep)]
+            raw_rows.append(parts)
+
+    data_row_indices = []
+    for idx, row in enumerate(raw_rows):
+        if len(row) > 1:
+            val_a = row[0].replace(".0", "").strip()
+            if val_a.isdigit() and len(val_a) > 0:
+                try:
+                    float(row[1])
+                    data_row_indices.append(idx)
+                except ValueError:
+                    pass
 
     profiles = {}
-    num_rows = len(df_lcms_raw)
-
-    def is_valid_profile_id(val):
-        s = str(val).strip().replace(".0", "")
-        return s.isdigit() and len(s) > 0
-
-    data_rows = []
-    for idx in range(num_rows):
-        val_a = df_lcms_raw.iloc[idx, 0]
-        val_b = (
-            str(df_lcms_raw.iloc[idx, 1])
-            .replace(",", ".")
-            .replace("-", "")
-            .strip()
-        )
-        if is_valid_profile_id(val_a):
-            try:
-                float(val_b)
-                data_rows.append(idx)
-            except Exception:
-                pass
-
     prof_idx = 1
-    for k in range(0, len(data_rows) - 1, 2):
-        r_left_h = data_rows[k]
+    for k in range(0, len(data_row_indices) - 1, 2):
+        r_left_h = data_row_indices[k]
         r_left_d = r_left_h + 1
-        r_right_h = data_rows[k + 1]
+        r_right_h = data_row_indices[k + 1]
         r_right_d = r_right_h + 1
 
-        if r_right_d >= num_rows:
+        if r_right_d >= len(raw_rows):
             break
 
         try:
-            rut_l_str = str(df_lcms_raw.iloc[r_left_h, 1]).replace(",", ".").strip()
-            rut_r_str = str(df_lcms_raw.iloc[r_left_h, 2]).replace(",", ".").strip()
+            row_lh = raw_rows[r_left_h]
+            row_ld = raw_rows[r_left_d]
+            row_rh = raw_rows[r_right_h]
+            row_rd = raw_rows[r_right_d]
 
-            rut_l = (
-                float(rut_l_str)
-                if rut_l_str.replace(".", "", 1).replace("-", "").isdigit()
-                else 0.0
+            rut_l = float(row_lh[1]) if len(row_lh) > 1 and row_lh[1] != "" else 0.0
+            rut_r = float(row_lh[2]) if len(row_lh) > 2 and row_lh[2] != "" else 0.0
+
+            x_left = [float(v) for v in row_lh[3:] if v != ""]
+            z_left = [float(v) for v in row_ld[3:] if v != ""]
+
+            x_right = [float(v) for v in row_rh[3:] if v != ""]
+            z_right = [float(v) for v in row_rd[3:] if v != ""]
+
+            min_len_l = min(len(x_left), len(z_left))
+            x_l_arr, z_l_arr = (
+                np.array(x_left[:min_len_l]),
+                np.array(z_left[:min_len_l]),
             )
-            rut_r = (
-                float(rut_r_str)
-                if rut_r_str.replace(".", "", 1).replace("-", "").isdigit()
-                else 0.0
+
+            min_len_r = min(len(x_right), len(z_right))
+            x_r_arr, z_r_arr = (
+                np.array(x_right[:min_len_r]),
+                np.array(z_right[:min_len_r]),
             )
 
-            x_left = pd.to_numeric(
-                df_lcms_raw.iloc[r_left_h, 3:]
-                .astype(str)
-                .str.replace(",", "."),
-                errors="coerce",
-            ).values
-            z_left = pd.to_numeric(
-                df_lcms_raw.iloc[r_left_d, 3:]
-                .astype(str)
-                .str.replace(",", "."),
-                errors="coerce",
-            ).values
-
-            x_right = pd.to_numeric(
-                df_lcms_raw.iloc[r_right_h, 3:]
-                .astype(str)
-                .str.replace(",", "."),
-                errors="coerce",
-            ).values
-            z_right = pd.to_numeric(
-                df_lcms_raw.iloc[r_right_d, 3:]
-                .astype(str)
-                .str.replace(",", "."),
-                errors="coerce",
-            ).values
-
-            valid_l = ~np.isnan(x_left) & ~np.isnan(z_left)
-            x_left, z_left = x_left[valid_l], z_left[valid_l]
-
-            valid_r = ~np.isnan(x_right) & ~np.isnan(z_right)
-            x_right, z_right = x_right[valid_r], z_right[valid_r]
-
-            x_full = np.concatenate([x_left, x_right])
+            x_full = np.concatenate([x_l_arr, x_r_arr])
             if len(x_full) > 0 and np.max(np.abs(x_full)) > 20:
                 x_full = x_full / 1000.0
 
-            z_full = np.concatenate([z_left, z_right])
+            z_full = np.concatenate([z_l_arr, z_r_arr])
 
             sort_order = np.argsort(x_full)
             x_sorted = x_full[sort_order]
@@ -635,15 +610,46 @@ if bytes_rsp is not None and (
 ):
     _, _, auto_x_from_rsp = parse_native_rsp_file(bytes_rsp)
 
-st.sidebar.header("3. Synchronizacja i Pikietaż (Wpisz wartość)")
+st.sidebar.header("3. Synchronizacja i Pikietaż")
+
+
+# Dwukierunkowa obsługa Suwaka i Wpisywania
+def sync_offset_from_slider():
+    st.session_state["offset_pikitaz_input"] = float(
+        st.session_state["offset_slider_key"]
+    )
+
+
+def sync_offset_from_input():
+    st.session_state["offset_slider_key"] = int(
+        round(st.session_state["offset_pikitaz_input"])
+    )
+
+
+if "offset_slider_key" not in st.session_state:
+    st.session_state["offset_slider_key"] = int(
+        round(st.session_state["offset_pikitaz_input"])
+    )
+
+st.sidebar.slider(
+    "🎚️ Suwak przesunięcia [profili]:",
+    min_value=-200,
+    max_value=200,
+    value=int(round(st.session_state["offset_pikitaz_input"])),
+    step=1,
+    key="offset_slider_key",
+    on_change=sync_offset_from_slider,
+)
+
 glowny_offset = st.sidebar.number_input(
-    "Wpisz przesunięcie LCMS względem RSP [metry / profili]:",
+    "✍️ Wpisz dokładnie [m / profili]:",
     min_value=-500.0,
     max_value=500.0,
     value=float(st.session_state["offset_pikitaz_input"]),
     step=0.1,
     format="%.1f",
     key="offset_pikitaz_input",
+    on_change=sync_offset_from_input,
 )
 
 podziel_na_sekcje = st.sidebar.checkbox(
@@ -814,6 +820,7 @@ if bytes_rsp is not None:
                 df_all_rsp_ruts["RSP_Rut_Max"].values, lcms_file_rut_max
             )
             st.session_state["offset_pikitaz_input"] = float(sug_offset)
+            st.session_state["offset_slider_key"] = int(round(sug_offset))
             st.sidebar.success(
                 f"✅ Optymalne przesunięcie pikietażu wynosi: {sug_offset:+} m"
             )
@@ -942,7 +949,6 @@ if bytes_rsp is not None:
         st.markdown("##### 🟩 Dane z Systemu LCMS")
         lc1, lc2, lc3 = st.columns(3)
         if kol_lcms_l is not None and kol_lcms_p is not None:
-            # Reaktywny wybór wartości w zależności od opcji 5
             if zrodlo_lcms == "Z pliku LCMS (surowe B2/C2)":
                 disp_l, disp_p = kol_lcms_l, kol_lcms_p
                 label_sub = "(z pliku B2/C2)"
@@ -975,7 +981,7 @@ if bytes_rsp is not None:
         # WYKRES PRZEKROJU POPRZECZNEGO
         fig = go.Figure()
 
-        # Profil RSP (Zaokrąglona linia Spline)
+        # Profil RSP
         fig.add_trace(
             go.Scatter(
                 x=x_vals,
@@ -1064,7 +1070,7 @@ if bytes_rsp is not None:
                 xanchor="right",
             )
 
-        # Obróbka i Łata LCMS z precyzyjną geometrią X
+        # Profil LCMS z dokładnym przesunięciem poprzecznym
         if prof_lcms_data is not None:
             x_lcms_orig = prof_lcms_data["x"].copy()
             z_lcms_raw = prof_lcms_data["z"]
@@ -1075,7 +1081,6 @@ if bytes_rsp is not None:
 
             x_lcms = x_lcms_orig.copy()
 
-            # Precyzyjne dopasowanie geometrii krawędzi
             if skaluj_szerokosc and len(x_lcms) > 1:
                 lcms_min = np.min(x_lcms)
                 lcms_max = np.max(x_lcms)
@@ -1152,7 +1157,6 @@ if bytes_rsp is not None:
                     )
                 )
 
-                # Wartość do wyświetlenia w etykietach LCMS w zależności od opcji 5
                 val_l_show = (
                     kol_lcms_l
                     if zrodlo_lcms == "Z pliku LCMS (surowe B2/C2)"
@@ -1166,7 +1170,6 @@ if bytes_rsp is not None:
                     else calc_lcms_rut_r
                 )
 
-                # Etykieta LCMS LEWA
                 diff_lcms_l = lata_plot_l_zero - (
                     z_lcms_plot[: idx_crown_lcms + 1]
                 )
@@ -1197,7 +1200,6 @@ if bytes_rsp is not None:
                     xanchor="left",
                 )
 
-                # Etykieta LCMS PRAWA
                 diff_lcms_r = lata_plot_r_zero - (z_lcms_plot[idx_crown_lcms:])
                 idx_k_r_c_rel = np.argmax(diff_lcms_r)
                 idx_k_r_c = idx_crown_lcms + idx_k_r_c_rel
@@ -1266,7 +1268,6 @@ if bytes_rsp is not None:
             lcms_calc_rut_r = df_lcms_calc_all["LCMS_Calc_Rut_R"].values
             lcms_calc_rut_max = df_lcms_calc_all["LCMS_Calc_Rut_Max"].values
 
-            # Przesunięcia sekcyjne pikietażu
             lcms_p_shifted = []
             for p in list_lcms_p:
                 if podziel_na_sekcje:
