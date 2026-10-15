@@ -7,31 +7,13 @@ import plotly.graph_objects as go
 import streamlit as st
 
 # ==========================================
-# DOKŁADNE POZYCJE LASERÓW RSP [m] Z KONFIGURACJI
+# SKRAAJNE POZYCJE LASERÓW RSP [m] Z KONFIGURACJI (-1695mm do 1700mm)
 # ==========================================
-EXACT_RSP_X_M = [
-    -1.610,
-    -1.444,
-    -1.285,
-    -1.145,
-    -1.007,
-    -0.850,
-    -0.700,
-    -0.550,
-    -0.400,
-    -0.200,
-    0.000,
-    0.200,
-    0.400,
-    0.550,
-    0.700,
-    0.850,
-    1.003,
-    1.140,
-    1.280,
-    1.440,
-    1.618,
-]
+DEFAULT_RSP_X_STR = (
+    "-1.695, -1.510, -1.320, -1.160, -1.007, -0.850, -0.700, -0.550, -0.400, "
+    "-0.200, 0.000, 0.200, 0.400, 0.550, 0.700, 0.850, 1.003, 1.158, 1.318, "
+    "1.510, 1.700"
+)
 
 
 # ==========================================
@@ -229,7 +211,7 @@ def parse_lcms_excel_cached(file_bytes, file_name):
 
 @st.cache_data
 def parse_lcms_xml(file_bytes):
-    """Parser pliku XML LCMS ze ścisłym sortowaniem po pikietażu (bez linii powrotnych na mapie)."""
+    """Parser pliku XML LCMS ze ścisłym sortowaniem po pikietażu (bez powrotnych linii prostych)."""
     tree = ET.ElementTree(ET.fromstring(file_bytes))
     root = tree.getroot()
 
@@ -256,7 +238,6 @@ def parse_lcms_xml(file_bytes):
 
     df_xml = pd.DataFrame(records)
     if not df_xml.empty:
-        # Usunięcie powracających prostopadłych linii i sortowanie jednokierunkowe
         df_xml = (
             df_xml.sort_values(by="Station_m")
             .drop_duplicates(subset=["Station_m"])
@@ -305,7 +286,7 @@ def get_upper_hull(x_sec, y_sec):
 
 @st.cache_data
 def compute_all_rsp_ruts_cached(df_rsp, x_vals_tuple):
-    """Przetwarza całą trasę RSP i oblicza koleiny z łaty."""
+    """Przetwarza całą trasę RSP i oblicza koleiny z łaty DSN 2019."""
     col_profil = "Profil" if "Profil" in df_rsp.columns else df_rsp.columns[0]
     laser_cols = [c for c in df_rsp.columns if c != col_profil]
 
@@ -342,7 +323,7 @@ def compute_all_rsp_ruts_cached(df_rsp, x_vals_tuple):
 def make_map_trace(
     lat, lon, mode="lines", marker=None, line=None, name="", text=None
 ):
-    """Tworzy warstwę mapy z pełną wsteczną kompatybilnością parametrów Plotly."""
+    """Kreator warstwy mapy bezpieczny dla różnych wersji Plotly."""
     kwargs = {"lat": lat, "lon": lon, "mode": mode, "name": name}
     if marker is not None:
         kwargs["marker"] = marker
@@ -371,7 +352,7 @@ st.set_page_config(
 st.title("⚡ System Analizy RSP + LCMS (DSN 2019)")
 
 # ==========================================
-# 3. PANEL BOCZNY (PRZECIĄGANIE LUB AUTO-DANE)
+# 3. PANEL BOCZNY (EDYCJA GEOMETRII I AUTO-DANE)
 # ==========================================
 st.sidebar.header("1. Dane RSP (Profilograf)")
 uploaded_rsp = st.sidebar.file_uploader(
@@ -391,7 +372,7 @@ uploaded_xml = st.sidebar.file_uploader(
     "Wgraj plik XML z LCMS (GPS)", type=["xml"], key="xml_input"
 )
 
-# Pobieranie treści z uploadu lub z folderu data/
+# Pobieranie z uploadu lub z pliku lokalnego
 bytes_rsp, name_rsp = get_file_bytes_and_name(
     uploaded_rsp, ["data/rsp.xlsx", "data/rsp.csv", "rsp.xlsx", "rsp.csv"]
 )
@@ -413,7 +394,7 @@ bytes_xml, name_xml = get_file_bytes_and_name(
 )
 
 if uploaded_rsp is None and bytes_rsp is not None:
-    st.sidebar.info(f"ℹ️ Załadowano domyślny plik RSP: `{name_rsp}`")
+    st.sidebar.info(f"ℹ️ Wczytano automatycznie plik RSP: `{name_rsp}`")
 
 st.sidebar.header("3. Synchronizacja i Pikietaż")
 offset_pikitaz = st.sidebar.slider(
@@ -426,12 +407,46 @@ offset_pikitaz = st.sidebar.slider(
 
 st.sidebar.header("4. Geometria Belki RSP")
 typ_geometrii = st.sidebar.radio(
-    "Geometria czujników RSP:",
-    ["Dokładna konfiguracja RSP (21 czujników)", "Stały odstęp (równomierny)"],
+    "Typ konfiguracji czujników RSP:",
+    ["Wpisz/Edytuj pozycje X czujników [m]", "Stały odstęp (równomierny)"],
 )
 
-if typ_geometrii == "Dokładna konfiguracja RSP (21 czujników)":
-    pozycja_x = EXACT_RSP_X_M
+if typ_geometrii == "Wpisz/Edytuj pozycje X czujników [m]":
+    x_input_str = st.sidebar.text_area(
+        "Pozycje X [m] dla 21 laserów (rozdzielone przecinkami):",
+        value=DEFAULT_RSP_X_STR,
+        height=100,
+    )
+    try:
+        pozycja_x = [
+            float(val.strip().replace(",", "."))
+            for val in x_input_str.split(",")
+            if val.strip() != ""
+        ]
+    except Exception:
+        pozycja_x = [
+            -1.695,
+            -1.510,
+            -1.320,
+            -1.160,
+            -1.007,
+            -0.850,
+            -0.700,
+            -0.550,
+            -0.400,
+            -0.200,
+            0.000,
+            0.200,
+            0.400,
+            0.550,
+            0.700,
+            0.850,
+            1.003,
+            1.158,
+            1.318,
+            1.510,
+            1.700,
+        ]
 else:
     krok_laserow = st.sidebar.number_input(
         "Odstęp [m]:",
@@ -466,7 +481,7 @@ wyrownaj_spadek_lcms = st.sidebar.checkbox(
 )
 pokaz_late_lcms = st.sidebar.checkbox("Pokaż łatę i koleiny LCMS", value=True)
 
-# Parsowanie wczytanych danych
+# Parsowanie plików GPS i LCMS
 df_rsp_gps = None
 if bytes_rsp_gps is not None:
     try:
@@ -492,7 +507,7 @@ if bytes_xml is not None:
         st.sidebar.error(f"Błąd XML: {e}")
 
 # ==========================================
-# 4. GŁÓWNA LOGIKA DANYCH I WYKRESÓW
+# 4. GŁÓWNA LOGIKA ANALIZY I WYKRESÓW
 # ==========================================
 if bytes_rsp is not None:
     df_rsp = load_rsp_data(bytes_rsp, name_rsp)
@@ -616,7 +631,7 @@ if bytes_rsp is not None:
 
         fig = go.Figure()
 
-        # RSP Plot (ZAOKRĄGLONA LINIA SPLINE)
+        # RSP Plot (Zaokrąglona linia Spline)
         fig.add_trace(
             go.Scatter(
                 x=x_vals,
@@ -649,6 +664,7 @@ if bytes_rsp is not None:
                 )
             )
 
+            # Wskaźnik i Etykieta RSP Lewa (PO LEWEJ STRONIE KRESKI -> xanchor='right')
             x_kl, y_kl_prof, y_kl_lata = (
                 x_vals[idx_kol_l],
                 y_vals[idx_kol_l],
@@ -664,7 +680,19 @@ if bytes_rsp is not None:
                     marker=dict(size=6, symbol="triangle-down"),
                 )
             )
+            fig.add_annotation(
+                x=x_kl,
+                y=(y_kl_lata + y_kl_prof) / 2,
+                text=f" <b>RSP: {koleina_lewa_mm:.1f} mm</b>",
+                showarrow=False,
+                font=dict(color="crimson", size=12),
+                bgcolor="rgba(255, 255, 255, 0.95)",
+                bordercolor="crimson",
+                borderwidth=1,
+                xanchor="right",
+            )
 
+            # Wskaźnik i Etykieta RSP Prawa (PO LEWEJ STRONIE KRESKI -> xanchor='right')
             x_kp, y_kp_prof, y_kp_lata = (
                 x_vals[idx_kol_p],
                 y_vals[idx_kol_p],
@@ -679,6 +707,17 @@ if bytes_rsp is not None:
                     line=dict(color="darkorange", width=3),
                     marker=dict(size=6, symbol="triangle-down"),
                 )
+            )
+            fig.add_annotation(
+                x=x_kp,
+                y=(y_kp_prof + y_kp_lata) / 2,
+                text=f" <b>RSP: {koleina_prawa_mm:.1f} mm</b>",
+                showarrow=False,
+                font=dict(color="darkorange", size=12),
+                bgcolor="rgba(255, 255, 255, 0.95)",
+                bordercolor="darkorange",
+                borderwidth=1,
+                xanchor="right",
             )
 
         # LCMS Plot
@@ -751,6 +790,60 @@ if bytes_rsp is not None:
                     )
                 )
 
+                # Wskaźnik i Etykieta LCMS Lewa (PO PRAWEJ STRONIE KRESKI -> xanchor='left')
+                x_kl_c = x_lcms_l[idx_kol_lcms_l]
+                y_kl_c_prof = z_lcms_l[idx_kol_lcms_l]
+                y_kl_c_lata = lata_lcms_l_y[idx_kol_lcms_l]
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=[x_kl_c, x_kl_c],
+                        y=[y_kl_c_lata, y_kl_c_prof],
+                        mode="lines+markers",
+                        name=f"Głębokość LCMS Lewa ({calc_lcms_rut_l:.1f} mm)",
+                        line=dict(color="forestgreen", width=2.5),
+                        marker=dict(size=5, symbol="triangle-down"),
+                    )
+                )
+                fig.add_annotation(
+                    x=x_kl_c,
+                    y=(y_kl_c_lata + y_kl_c_prof) / 2,
+                    text=f"<b>LCMS: {calc_lcms_rut_l:.1f} mm</b> ",
+                    showarrow=False,
+                    font=dict(color="forestgreen", size=12),
+                    bgcolor="rgba(235, 255, 235, 0.95)",
+                    bordercolor="forestgreen",
+                    borderwidth=1,
+                    xanchor="left",
+                )
+
+                # Wskaźnik i Etykieta LCMS Prawa (PO PRAWEJ STRONIE KRESKI -> xanchor='left')
+                x_kp_c = x_lcms_raw[idx_kol_lcms_r]
+                y_kp_c_prof = z_lcms_plot[idx_kol_lcms_r]
+                y_kp_c_lata = lata_lcms_r_y[idx_kol_lcms_r_rel]
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=[x_kp_c, x_kp_c],
+                        y=[y_kp_c_lata, y_kp_c_prof],
+                        mode="lines+markers",
+                        name=f"Głębokość LCMS Prawa ({calc_lcms_rut_r:.1f} mm)",
+                        line=dict(color="forestgreen", width=2.5),
+                        marker=dict(size=5, symbol="triangle-down"),
+                    )
+                )
+                fig.add_annotation(
+                    x=x_kp_c,
+                    y=(y_kp_c_lata + y_kp_c_prof) / 2,
+                    text=f"<b>LCMS: {calc_lcms_rut_r:.1f} mm</b> ",
+                    showarrow=False,
+                    font=dict(color="forestgreen", size=12),
+                    bgcolor="rgba(235, 255, 235, 0.95)",
+                    bordercolor="forestgreen",
+                    borderwidth=1,
+                    xanchor="left",
+                )
+
         fig.add_vline(
             x=0,
             line_width=1,
@@ -765,7 +858,7 @@ if bytes_rsp is not None:
             yaxis_title=y_label,
             height=580,
             hovermode="x unified",
-            xaxis=dict(range=[-1.75, 1.75], dtick=0.2),
+            xaxis=dict(range=[-1.85, 1.85], dtick=0.2),
             yaxis=dict(autorange=True if tryb_zero_l11 else "reversed"),
         )
 
@@ -965,7 +1058,7 @@ if bytes_rsp is not None:
             )
             st.plotly_chart(fig_all, use_container_width=True)
 
-        # Map GPS (Dwa Ślady, Jednokierunkowa trasa LCMS)
+        # Mapa GPS (Dwa Ślady, Jednokierunkowa trasa LCMS)
         if df_rsp_gps is not None or df_xml_gps is not None:
             st.markdown("---")
             st.subheader("🗺️ Analiza Pozycji GPS i Przesunięcia Terenowego")
@@ -1057,16 +1150,17 @@ if bytes_rsp is not None:
                         ],
                     )
                 )
-                fig_map.add_trace(
-                    make_map_trace(
-                        lat=[row_rsp_gps["LAT"]],
-                        lon=[row_rsp_gps["LON"]],
-                        mode="markers",
-                        marker=dict(size=14, color="red"),
-                        name=f"Profil RSP {wybrany_profil}",
-                        text=[f"Pozycja RSP nr {wybrany_profil}"],
+                if row_rsp_gps is not None:
+                    fig_map.add_trace(
+                        make_map_trace(
+                            lat=[row_rsp_gps["LAT"]],
+                            lon=[row_rsp_gps["LON"]],
+                            mode="markers",
+                            marker=dict(size=14, color="red"),
+                            name=f"Profil RSP {wybrany_profil}",
+                            text=[f"Pozycja RSP nr {wybrany_profil}"],
+                        )
                     )
-                )
 
             if df_xml_gps is not None:
                 fig_map.add_trace(
@@ -1085,19 +1179,20 @@ if bytes_rsp is not None:
                         ],
                     )
                 )
-                fig_map.add_trace(
-                    make_map_trace(
-                        lat=[row_lcms_gps["LAT"]],
-                        lon=[row_lcms_gps["LON"]],
-                        mode="markers",
-                        marker=dict(size=12, color="darkorange"),
-                        name=f"Profil LCMS {wybrany_profil_lcms}",
-                        text=[
-                            f"LCMS Profil {wybrany_profil_lcms}<br>Pikietaż:"
-                            f" {row_lcms_gps['Station_m']}m"
-                        ],
+                if row_lcms_gps is not None:
+                    fig_map.add_trace(
+                        make_map_trace(
+                            lat=[row_lcms_gps["LAT"]],
+                            lon=[row_lcms_gps["LON"]],
+                            mode="markers",
+                            marker=dict(size=12, color="darkorange"),
+                            name=f"Profil LCMS {wybrany_profil_lcms}",
+                            text=[
+                                f"LCMS Profil {wybrany_profil_lcms}<br>Pikietaż:"
+                                f" {row_lcms_gps['Station_m']}m"
+                            ],
+                        )
                     )
-                )
 
             if (
                 row_rsp_gps is not None
