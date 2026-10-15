@@ -67,6 +67,16 @@ def get_dsn_color(klasa):
         return "#dc3545"  # Czerwony
 
 
+def safe_float(val):
+    """Bezpieczna konwersja wartości tekstowych na float (obsługuje przecinki i puste ciągi)."""
+    if val is None or not str(val).strip():
+        return None
+    try:
+        return float(str(val).replace(",", ".").strip())
+    except ValueError:
+        return None
+
+
 # ==========================================
 # 2. PARSERY SUROWYCH PLIKÓW (.RSP, .GPX, .CSV, .XLSX, .XML, .2025)
 # ==========================================
@@ -94,50 +104,19 @@ def parse_kolc_xml(file_bytes):
             lat = odc.findtext("LAT")
             lon = odc.findtext("LON")
 
-            st_p = (
-                float(km_p.replace(",", ".")) * 1000.0
-                if km_p and km_p.strip()
-                else float(idx + 1)
-            )
+            st_p = safe_float(km_p)
+            st_m = st_p * 1000.0 if st_p is not None else float(idx + 1)
 
             records.append({
                 "Profil": idx + 1,
-                "Km_P": (
-                    float(km_p.replace(",", "."))
-                    if km_p and km_p.strip()
-                    else None
-                ),
-                "Km_K": (
-                    float(km_k.replace(",", "."))
-                    if km_k and km_k.strip()
-                    else None
-                ),
-                "Station_m": st_p,
-                "L_KOL": (
-                    float(l_kol.replace(",", "."))
-                    if l_kol and l_kol.strip()
-                    else 0.0
-                ),
-                "P_KOL": (
-                    float(p_kol.replace(",", "."))
-                    if p_kol and p_kol.strip()
-                    else 0.0
-                ),
-                "PEL_KOL": (
-                    float(pel_kol.replace(",", "."))
-                    if pel_kol and pel_kol.strip()
-                    else 0.0
-                ),
-                "LAT": (
-                    float(lat.replace(",", "."))
-                    if lat and lat.strip()
-                    else None
-                ),
-                "LON": (
-                    float(lon.replace(",", "."))
-                    if lon and lon.strip()
-                    else None
-                ),
+                "Km_P": st_p,
+                "Km_K": safe_float(km_k),
+                "Station_m": st_m,
+                "L_KOL": safe_float(l_kol) or 0.0,
+                "P_KOL": safe_float(p_kol) or 0.0,
+                "PEL_KOL": safe_float(pel_kol) or 0.0,
+                "LAT": safe_float(lat),
+                "LON": safe_float(lon),
             })
 
         df = pd.DataFrame(records)
@@ -274,24 +253,75 @@ def get_file_bytes_and_name(uploaded_file, default_paths):
 
 @st.cache_data
 def load_rsp_data(file_bytes, file_name):
-    """Wczytuje i keszuje dane RSP."""
-    if file_name.lower().endswith(".rsp") or file_name.lower().endswith(".txt"):
+    """Wczytuje i keszuje dane RSP z pełną odpornością na niestandardowe rozszerzenia."""
+    ext = file_name.lower()
+
+    # 1. Próba KOLC XML (.2025, .xml, itp.)
+    df_kolc = parse_kolc_xml(file_bytes)
+    if df_kolc is not None:
+        l_cols_exist = [c for c in df_kolc.columns if c.startswith("L") and c[1:].isdigit()]
+        if len(l_cols_exist) == 0:
+            for i in range(1, 22):
+                df_kolc[f"L{i}"] = 0.0
+            if "L_KOL" in df_kolc.columns and "P_KOL" in df_kolc.columns:
+                df_kolc["L6"] = df_kolc["L_KOL"]
+                df_kolc["L16"] = df_kolc["P_KOL"]
+        return df_kolc
+
+    # 2. Surowe pliki Dynatest .rsp / .txt
+    if ext.endswith(".rsp") or ext.endswith(".txt"):
         df_prof, _, _ = parse_native_rsp_file(file_bytes)
         if df_prof is not None:
             return df_prof
 
-    if file_name.lower().endswith(".csv"):
+    # 3. CSV / TXT
+    if ext.endswith(".csv") or ext.endswith(".txt"):
+        try:
+            df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python")
+            df.columns = df.columns.str.strip()
+            return df
+        except Exception:
+            pass
+
+    # 4. Excel (.xlsx / .xls)
+    if ext.endswith(".xlsx") or ext.endswith(".xls"):
+        try:
+            df = pd.read_excel(io.BytesIO(file_bytes))
+            df.columns = df.columns.str.strip()
+            return df
+        except Exception:
+            pass
+
+    # 5. Ostateczny fallback – próba wszystkich parserów po kolei
+    try:
+        df_prof, _, _ = parse_native_rsp_file(file_bytes)
+        if df_prof is not None:
+            return df_prof
+    except Exception:
+        pass
+
+    try:
         df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python")
-    else:
+        df.columns = df.columns.str.strip()
+        return df
+    except Exception:
+        pass
+
+    try:
         df = pd.read_excel(io.BytesIO(file_bytes))
-    df.columns = df.columns.str.strip()
-    return df
+        df.columns = df.columns.str.strip()
+        return df
+    except Exception:
+        pass
+
+    raise ValueError(f"Nie rozpoznano formatu pliku RSP ({file_name}).")
 
 
 @st.cache_data
 def parse_rsp_gps_cached(file_bytes, file_name):
     """Parser GPS z plików GPX / RSP / CSV / Excel / KOLC XML."""
-    # Próba sparsowania pliku KOLC XML (np. .2025, .xml)
+    ext = file_name.lower()
+
     df_kolc = parse_kolc_xml(file_bytes)
     if df_kolc is not None and "LAT" in df_kolc.columns:
         df_gps = df_kolc.dropna(subset=["LAT", "LON"]).copy()
@@ -299,25 +329,27 @@ def parse_rsp_gps_cached(file_bytes, file_name):
             df_gps["Profil_idx"] = df_gps["Profil"]
             return df_gps
 
-    if file_name.lower().endswith(".gpx"):
+    if ext.endswith(".gpx"):
         df_gpx = parse_gpx_cached(file_bytes)
         if df_gpx is not None:
             return df_gpx
 
-    if file_name.lower().endswith(".rsp") or file_name.lower().endswith(".txt"):
+    if ext.endswith(".rsp") or ext.endswith(".txt"):
         _, df_gps, _ = parse_native_rsp_file(file_bytes)
         if df_gps is not None:
             return df_gps
 
-    if file_name.lower().endswith(".csv") or file_name.lower().endswith(".txt"):
+    df = None
+    try:
+        df = pd.read_csv(io.BytesIO(file_bytes), header=None, sep=None, engine="python")
+    except Exception:
         try:
-            df = pd.read_csv(
-                io.BytesIO(file_bytes), header=None, sep=None, engine="python"
-            )
+            df = pd.read_excel(io.BytesIO(file_bytes), header=None)
         except Exception:
-            df = pd.read_csv(io.BytesIO(file_bytes), header=None, sep=";")
-    else:
-        df = pd.read_excel(io.BytesIO(file_bytes), header=None)
+            return None
+
+    if df is None:
+        return None
 
     df_clean = df.copy()
     for col in df_clean.columns:
@@ -369,13 +401,16 @@ def parse_lcms_raw_cached(file_bytes, file_name):
         return profiles
 
     if file_name.lower().endswith(".xlsx") or file_name.lower().endswith(".xls"):
-        df_excel = pd.read_excel(io.BytesIO(file_bytes), header=None)
-        raw_rows = []
-        for _, r in df_excel.iterrows():
-            raw_rows.append([
-                str(v).replace(",", ".").strip() if pd.notna(v) else ""
-                for v in r.values
-            ])
+        try:
+            df_excel = pd.read_excel(io.BytesIO(file_bytes), header=None)
+            raw_rows = []
+            for _, r in df_excel.iterrows():
+                raw_rows.append([
+                    str(v).replace(",", ".").strip() if pd.notna(v) else ""
+                    for v in r.values
+                ])
+        except Exception:
+            return {}
     else:
         text = file_bytes.decode("utf-8", errors="ignore")
         lines = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
@@ -464,41 +499,45 @@ def parse_lcms_xml(file_bytes):
     df_kolc = parse_kolc_xml(file_bytes)
     if df_kolc is not None and "LAT" in df_kolc.columns:
         res = df_kolc.dropna(subset=["LAT", "LON"]).copy()
-        res["Filename"] = "KOLC_XML"
-        return res
+        if not res.empty:
+            res["Filename"] = "KOLC_XML"
+            return res
 
-    tree = ET.ElementTree(ET.fromstring(file_bytes))
-    root = tree.getroot()
+    try:
+        tree = ET.ElementTree(ET.fromstring(file_bytes))
+        root = tree.getroot()
 
-    records = []
-    for elem in root.iter():
-        if "}" in elem.tag:
-            elem.tag = elem.tag.split("}", 1)[1]
+        records = []
+        for elem in root.iter():
+            if "}" in elem.tag:
+                elem.tag = elem.tag.split("}", 1)[1]
 
-    for pic in root.findall("PicIndex"):
-        station = pic.findtext("Station")
-        lat = pic.findtext("LAT")
-        lon = pic.findtext("LON")
-        filename = pic.findtext("Filename")
-        iddrogi = pic.findtext("IDDROGI")
+        for pic in root.findall("PicIndex"):
+            station = pic.findtext("Station")
+            lat = pic.findtext("LAT")
+            lon = pic.findtext("LON")
+            filename = pic.findtext("Filename")
+            iddrogi = pic.findtext("IDDROGI")
 
-        if lat and lon:
-            records.append({
-                "Station_m": float(station) if station else 0.0,
-                "LAT": float(lat),
-                "LON": float(lon),
-                "Filename": filename if filename else "",
-                "IDDROGI": iddrogi if iddrogi else "",
-            })
+            if lat and lon:
+                records.append({
+                    "Station_m": safe_float(station) or 0.0,
+                    "LAT": safe_float(lat) or 0.0,
+                    "LON": safe_float(lon) or 0.0,
+                    "Filename": filename if filename else "",
+                    "IDDROGI": iddrogi if iddrogi else "",
+                })
 
-    df_xml = pd.DataFrame(records)
-    if not df_xml.empty:
-        df_xml = (
-            df_xml.sort_values(by="Station_m")
-            .drop_duplicates(subset=["Station_m"])
-            .reset_index(drop=True)
-        )
-    return df_xml
+        df_xml = pd.DataFrame(records)
+        if not df_xml.empty:
+            df_xml = (
+                df_xml.sort_values(by="Station_m")
+                .drop_duplicates(subset=["Station_m"])
+                .reset_index(drop=True)
+            )
+        return df_xml
+    except Exception:
+        return None
 
 
 def smooth_profile(z_vals, window_size=31):
@@ -543,7 +582,12 @@ def get_upper_hull(x_sec, y_sec):
 def compute_all_rsp_ruts_cached(df_rsp, x_vals_tuple):
     """Przetwarza całą trasę RSP na potrzeby wykresu podłużnego."""
     col_profil = "Profil" if "Profil" in df_rsp.columns else df_rsp.columns[0]
-    laser_cols = [c for c in df_rsp.columns if c != col_profil]
+    
+    l_cols = [c for c in df_rsp.columns if c.startswith("L") and c[1:].isdigit()]
+    if len(l_cols) > 0:
+        laser_cols = sorted(l_cols, key=lambda c: int(c[1:]))
+    else:
+        laser_cols = [c for c in df_rsp.columns if c != col_profil]
 
     prof_ids = df_rsp[col_profil].values
     data_mat = df_rsp[laser_cols].values.astype(float)
@@ -1255,7 +1299,12 @@ if bytes_rsp is not None:
     wiersz_rsp = df_rsp[df_rsp[col_profil] == wybrany_profil]
 
     if not wiersz_rsp.empty:
-        kolumny_laserow = [c for c in df_rsp.columns if c != col_profil]
+        l_cols = [c for c in df_rsp.columns if c.startswith("L") and c[1:].isdigit()]
+        if len(l_cols) > 0:
+            kolumny_laserow = sorted(l_cols, key=lambda c: int(c[1:]))
+        else:
+            kolumny_laserow = [c for c in df_rsp.columns if c != col_profil]
+
         odczyty_raw = wiersz_rsp.iloc[0][kolumny_laserow].values.astype(float)
         ile_laserow = len(odczyty_raw)
 
