@@ -68,8 +68,84 @@ def get_dsn_color(klasa):
 
 
 # ==========================================
-# 2. PARSERY SUROWYCH PLIKÓW (.RSP, .GPX, .CSV, .XLSX)
+# 2. PARSERY SUROWYCH PLIKÓW (.RSP, .GPX, .CSV, .XLSX, .XML, .2025)
 # ==========================================
+def parse_kolc_xml(file_bytes):
+    """Parsuje pliki XML wymiany danych GDDKiA (KOLC_schema.xsd, np. rozszerzenia .2025, .xml)."""
+    try:
+        tree = ET.ElementTree(ET.fromstring(file_bytes))
+        root = tree.getroot()
+
+        for elem in root.iter():
+            if "}" in elem.tag:
+                elem.tag = elem.tag.split("}", 1)[1]
+
+        records = []
+        odcinki = root.findall("ODCINEK")
+        if not odcinki:
+            odcinki = [e for e in root.iter() if e.tag == "ODCINEK"]
+
+        for idx, odc in enumerate(odcinki):
+            km_p = odc.findtext("KM_P")
+            km_k = odc.findtext("KM_K")
+            l_kol = odc.findtext("L_KOL")
+            p_kol = odc.findtext("P_KOL")
+            pel_kol = odc.findtext("PEL_KOL")
+            lat = odc.findtext("LAT")
+            lon = odc.findtext("LON")
+
+            st_p = (
+                float(km_p.replace(",", ".")) * 1000.0
+                if km_p and km_p.strip()
+                else float(idx + 1)
+            )
+
+            records.append({
+                "Profil": idx + 1,
+                "Km_P": (
+                    float(km_p.replace(",", "."))
+                    if km_p and km_p.strip()
+                    else None
+                ),
+                "Km_K": (
+                    float(km_k.replace(",", "."))
+                    if km_k and km_k.strip()
+                    else None
+                ),
+                "Station_m": st_p,
+                "L_KOL": (
+                    float(l_kol.replace(",", "."))
+                    if l_kol and l_kol.strip()
+                    else 0.0
+                ),
+                "P_KOL": (
+                    float(p_kol.replace(",", "."))
+                    if p_kol and p_kol.strip()
+                    else 0.0
+                ),
+                "PEL_KOL": (
+                    float(pel_kol.replace(",", "."))
+                    if pel_kol and pel_kol.strip()
+                    else 0.0
+                ),
+                "LAT": (
+                    float(lat.replace(",", "."))
+                    if lat and lat.strip()
+                    else None
+                ),
+                "LON": (
+                    float(lon.replace(",", "."))
+                    if lon and lon.strip()
+                    else None
+                ),
+            })
+
+        df = pd.DataFrame(records)
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
 def parse_native_rsp_file(file_bytes):
     """Parsuje surowy plik Dynatest .rsp / .txt (linie 5201-5221, 5401, 5280)."""
     text = file_bytes.decode("utf-8", errors="ignore")
@@ -214,7 +290,15 @@ def load_rsp_data(file_bytes, file_name):
 
 @st.cache_data
 def parse_rsp_gps_cached(file_bytes, file_name):
-    """Parser GPS z plików GPX / RSP / CSV / Excel."""
+    """Parser GPS z plików GPX / RSP / CSV / Excel / KOLC XML."""
+    # Próba sparsowania pliku KOLC XML (np. .2025, .xml)
+    df_kolc = parse_kolc_xml(file_bytes)
+    if df_kolc is not None and "LAT" in df_kolc.columns:
+        df_gps = df_kolc.dropna(subset=["LAT", "LON"]).copy()
+        if not df_gps.empty:
+            df_gps["Profil_idx"] = df_gps["Profil"]
+            return df_gps
+
     if file_name.lower().endswith(".gpx"):
         df_gpx = parse_gpx_cached(file_bytes)
         if df_gpx is not None:
@@ -270,7 +354,20 @@ def parse_rsp_gps_cached(file_bytes, file_name):
 
 @st.cache_data
 def parse_lcms_raw_cached(file_bytes, file_name):
-    """Pancerny parser plików LCMS z obsługą surowego CSV linia po linii."""
+    """Pancerny parser plików LCMS z obsługą surowego CSV oraz KOLC XML (.2025)."""
+    df_kolc = parse_kolc_xml(file_bytes)
+    if df_kolc is not None:
+        profiles = {}
+        for _, r in df_kolc.iterrows():
+            pid = int(r["Profil"])
+            profiles[pid] = {
+                "x": np.array([-1.5, 1.5]),
+                "z": np.array([0.0, 0.0]),
+                "rut_l": float(r["L_KOL"]),
+                "rut_r": float(r["P_KOL"]),
+            }
+        return profiles
+
     if file_name.lower().endswith(".xlsx") or file_name.lower().endswith(".xls"):
         df_excel = pd.read_excel(io.BytesIO(file_bytes), header=None)
         raw_rows = []
@@ -363,7 +460,13 @@ def parse_lcms_raw_cached(file_bytes, file_name):
 
 @st.cache_data
 def parse_lcms_xml(file_bytes):
-    """Parser XML z LCMS."""
+    """Parser XML z LCMS oraz plików KOLC XML."""
+    df_kolc = parse_kolc_xml(file_bytes)
+    if df_kolc is not None and "LAT" in df_kolc.columns:
+        res = df_kolc.dropna(subset=["LAT", "LON"]).copy()
+        res["Filename"] = "KOLC_XML"
+        return res
+
     tree = ET.ElementTree(ET.fromstring(file_bytes))
     root = tree.getroot()
 
@@ -482,8 +585,8 @@ def compute_all_lcms_calc_ruts_cached(lcms_profiles):
         pdata = lcms_profiles[pid]
         x_pts, z_pts = pdata["x"], pdata["z"]
         if len(x_pts) < 10:
-            ruts_calc_l.append(0.0)
-            ruts_calc_r.append(0.0)
+            ruts_calc_l.append(pdata.get("rut_l", 0.0))
+            ruts_calc_r.append(pdata.get("rut_r", 0.0))
             continue
 
         z_smooth = smooth_profile(z_pts, window_size=31)
@@ -876,22 +979,24 @@ if "offset_pikitaz_input" not in st.session_state:
 # ==========================================
 st.sidebar.header("1. Dane RSP (Profilograf / Surowe)")
 uploaded_rsp = st.sidebar.file_uploader(
-    "Wgraj plik RSP (.rsp / .xlsx / .csv / .txt)",
-    type=["rsp", "xlsx", "csv", "txt"],
+    "Wgraj plik RSP (.rsp / .xlsx / .csv / .txt / .xml / .2025)",
+    type=None,
     key="rsp_input",
 )
 uploaded_rsp_gps = st.sidebar.file_uploader(
-    "Wgraj plik GPS RSP (.gpx / .rsp / .csv / .txt)",
-    type=["gpx", "rsp", "xlsx", "csv", "txt"],
+    "Wgraj plik GPS RSP (.gpx / .rsp / .csv / .txt / .xml / .2025)",
+    type=None,
     key="rsp_gps_input",
 )
 
-st.sidebar.header("2. Dane LCMS (Surowe CSV / Excel)")
+st.sidebar.header("2. Dane LCMS (Surowe CSV / Excel / XML GDDKiA)")
 uploaded_lcms = st.sidebar.file_uploader(
-    "Wgraj plik LCMS (.csv / .xlsx)", type=["csv", "xlsx"], key="lcms_input"
+    "Wgraj plik LCMS (.csv / .xlsx / .xml / .2025)",
+    type=None,
+    key="lcms_input",
 )
 uploaded_xml = st.sidebar.file_uploader(
-    "Wgraj plik XML z LCMS (GPS)", type=["xml"], key="xml_input"
+    "Wgraj plik XML z LCMS (GPS)", type=None, key="xml_input"
 )
 
 bytes_rsp, name_rsp = get_file_bytes_and_name(
@@ -2104,7 +2209,6 @@ if bytes_rsp is not None:
                 df_merged_ruts, step_m=1.0, section_m=50.0
             )
 
-            # SUB-TABS DLA ODCINKÓW 50M
             sub_dsn_l, sub_dsn_p, sub_dsn_max = st.tabs([
                 "👈 Lewa Koleina (L_KOL)",
                 "👉 Prawa Koleina (P_KOL)",
