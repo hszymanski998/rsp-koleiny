@@ -118,6 +118,8 @@ def get_upper_hull_pts(x_sec, y_sec):
 
 
 def get_upper_hull(x_sec, y_sec):
+    if len(x_sec) < 2:
+        return y_sec
     upper = get_upper_hull_pts(x_sec, y_sec)
     x_h = [p[0] for p in upper]
     y_h = [p[1] for p in upper]
@@ -1174,40 +1176,86 @@ if bytes_rsp is not None:
                 "rut_l", None
             ), prof_lcms_data.get("rut_r", None)
 
-        calc_lcms_rut_l, calc_lcms_rut_r = None, None
+        calc_lcms_rut_l, calc_lcms_rut_r = 0.0, 0.0
+
         if prof_lcms_data is not None:
-            x_lcms_orig, z_lcms_raw = (
-                prof_lcms_data["x"].copy(),
-                prof_lcms_data["z"],
-            )
+            x_lcms_orig = prof_lcms_data["x"].copy()
+            z_lcms_raw = prof_lcms_data["z"]
             z_lcms_smooth = smooth_profile(z_lcms_raw, window_size=31)
-            mid_mask_raw = (x_lcms_orig >= -0.5) & (x_lcms_orig <= 0.5)
-            idx_c_lcms = (
-                np.where(mid_mask_raw)[0][
-                    np.argmax(z_lcms_smooth[mid_mask_raw])
+
+            rsp_x_max, rsp_x_min = np.max(x_vals), np.min(x_vals)
+            x_lcms = x_lcms_orig.copy()
+
+            if (
+                tryb_dopasowania_x == "Zaczep do prawej krawędzi RSP"
+                and len(x_lcms) > 0
+            ):
+                x_lcms = x_lcms + (rsp_x_max - np.max(x_lcms))
+            elif (
+                tryb_dopasowania_x == "Wyśrodkuj osie (Zero w środku)"
+                and len(x_lcms) > 0
+            ):
+                lcms_mid = (np.min(x_lcms) + np.max(x_lcms)) / 2.0
+                x_lcms = x_lcms - lcms_mid
+
+            if skaluj_szerokosc and len(x_lcms) > 1:
+                lcms_min, lcms_max = np.min(x_lcms), np.max(x_lcms)
+                x_lcms = rsp_x_min + (x_lcms - lcms_min) * (
+                    (rsp_x_max - rsp_x_min) / (lcms_max - lcms_min)
+                )
+
+            x_lcms = x_lcms + manual_x_shift_lcms
+
+            if wyrownaj_spadek_lcms and len(x_lcms) > 10:
+                p_trend = np.polyfit(x_lcms, z_lcms_smooth, 1)
+                z_lcms_leveled = z_lcms_smooth - p_trend[0] * x_lcms
+            else:
+                z_lcms_leveled = z_lcms_smooth
+
+            idx_mid_lcms = np.argmin(np.abs(x_lcms))
+            z_ref_lcms = z_lcms_leveled[idx_mid_lcms]
+            z_lcms_plot = z_lcms_leveled - z_ref_lcms
+
+            # Obliczenie wirtualnej łaty dla LCMS na docelowych współrzędnych
+            mid_mask_lcms = (x_lcms >= -0.5) & (x_lcms <= 0.5)
+            if np.any(mid_mask_lcms):
+                idx_c_lcms = np.where(mid_mask_lcms)[0][
+                    np.argmax(z_lcms_plot[mid_mask_lcms])
                 ]
-                if np.any(mid_mask_raw)
-                else np.argmin(np.abs(x_lcms_orig))
+            else:
+                idx_c_lcms = np.argmin(np.abs(x_lcms))
+
+            x_lcms_l, z_lcms_l = (
+                x_lcms[: idx_c_lcms + 1],
+                z_lcms_plot[: idx_c_lcms + 1],
+            )
+            x_lcms_r, z_lcms_r = (
+                x_lcms[idx_c_lcms:],
+                z_lcms_plot[idx_c_lcms:],
             )
 
-            x_lcms_l_raw, z_lcms_l_raw = (
-                x_lcms_orig[: idx_c_lcms + 1],
-                z_lcms_smooth[: idx_c_lcms + 1],
+            lata_lcms_l = get_upper_hull(x_lcms_l, z_lcms_l)
+            lata_lcms_r = get_upper_hull(x_lcms_r, z_lcms_r)
+
+            diff_lcms_l = lata_lcms_l - z_lcms_l
+            diff_lcms_r = lata_lcms_r - z_lcms_r
+
+            idx_max_lcms_l = (
+                np.argmax(diff_lcms_l) if len(diff_lcms_l) > 0 else 0
             )
-            x_lcms_r_raw, z_lcms_r_raw = (
-                x_lcms_orig[idx_c_lcms:],
-                z_lcms_smooth[idx_c_lcms:],
+            idx_max_lcms_r = (
+                np.argmax(diff_lcms_r) if len(diff_lcms_r) > 0 else 0
             )
 
-            calc_lcms_rut_l = float(
-                np.max(
-                    get_upper_hull(x_lcms_l_raw, z_lcms_l_raw) - z_lcms_l_raw
-                )
+            calc_lcms_rut_l = (
+                float(diff_lcms_l[idx_max_lcms_l])
+                if len(diff_lcms_l) > 0
+                else 0.0
             )
-            calc_lcms_rut_r = float(
-                np.max(
-                    get_upper_hull(x_lcms_r_raw, z_lcms_r_raw) - z_lcms_r_raw
-                )
+            calc_lcms_rut_r = (
+                float(diff_lcms_r[idx_max_lcms_r])
+                if len(diff_lcms_r) > 0
+                else 0.0
             )
 
             if st.sidebar.button("⚡ Dopasuj poprzecznie (X) LCMS do RSP"):
@@ -1277,8 +1325,10 @@ if bytes_rsp is not None:
                     "Brak dopasowanego profilu LCMS dla obecnego pikietażu."
                 )
 
-            # WYKRES POPRZECZNY Z PRZESUNIĘCIEM X
+            # WYKRES POPRZECZNY Z PRZESUNIĘCIEM X I OBU WIRTUALNYMI ŁATAMI
             fig = go.Figure()
+
+            # 1. Profil RSP
             fig.add_trace(
                 go.Scatter(
                     x=x_vals,
@@ -1295,6 +1345,7 @@ if bytes_rsp is not None:
                 )
             )
 
+            # 2. Wirtualna łata RSP
             if pokaz_late_rsp:
                 fig.add_trace(
                     go.Scatter(
@@ -1381,81 +1432,100 @@ if bytes_rsp is not None:
                     ay=-30,
                 )
 
+            # 3. Profil LCMS oraz Wirtualna Łata LCMS
             if prof_lcms_data is not None:
-                x_lcms_orig = prof_lcms_data["x"].copy()
-                z_lcms_raw = prof_lcms_data["z"]
-                z_lcms_smooth = smooth_profile(z_lcms_raw, window_size=31)
-
-                rsp_x_max, rsp_x_min = np.max(x_vals), np.min(x_vals)
-                x_lcms = x_lcms_orig.copy()
-
-                if (
-                    tryb_dopasowania_x == "Zaczep do prawej krawędzi RSP"
-                    and len(x_lcms) > 0
-                ):
-                    x_lcms = x_lcms + (rsp_x_max - np.max(x_lcms))
-                elif (
-                    tryb_dopasowania_x == "Wyśrodkuj osie (Zero w środku)"
-                    and len(x_lcms) > 0
-                ):
-                    lcms_mid = (np.min(x_lcms) + np.max(x_lcms)) / 2.0
-                    x_lcms = x_lcms - lcms_mid
-
-                if skaluj_szerokosc and len(x_lcms) > 1:
-                    lcms_min, lcms_max = np.min(x_lcms), np.max(x_lcms)
-                    x_lcms = rsp_x_min + (x_lcms - lcms_min) * (
-                        (rsp_x_max - rsp_x_min) / (lcms_max - lcms_min)
-                    )
-
-                # Kluczowe: Przesunięcie X z suwaka!
-                x_lcms = x_lcms + manual_x_shift_lcms
-
-                if wyrownaj_spadek_lcms and len(x_lcms) > 10:
-                    p_trend = np.polyfit(x_lcms, z_lcms_smooth, 1)
-                    z_lcms_leveled = z_lcms_smooth - p_trend[0] * x_lcms
-                else:
-                    z_lcms_leveled = z_lcms_smooth
-
-                idx_mid_lcms = np.argmin(np.abs(x_lcms))
-                z_ref_lcms = z_lcms_leveled[idx_mid_lcms]
-                z_lcms_plot = z_lcms_leveled - z_ref_lcms
-
                 fig.add_trace(
                     go.Scatter(
                         x=x_lcms,
                         y=z_lcms_plot,
                         mode="lines",
                         name=f"Profil LCMS nr {wybrany_profil_lcms}",
-                        line=dict(color="forestgreen", width=2),
+                        line=dict(color="seagreen", width=2),
                     )
                 )
 
-                if kol_lcms_l is not None and kol_lcms_p is not None:
-                    fig.add_annotation(
-                        x=-0.8 + manual_x_shift_lcms,
-                        y=np.max(z_lcms_plot),
-                        text=(
-                            f"<b>LCMS L: {disp_l:.1f} mm</b> (Δ"
-                            f" {koleina_lewa_mm - disp_l:+.1f} mm)"
-                        ),
-                        showarrow=False,
-                        font=dict(color="forestgreen", size=11),
-                        bgcolor="rgba(235, 255, 235, 0.95)",
-                        bordercolor="forestgreen",
-                        borderwidth=1,
+                if pokaz_late_lcms and len(x_lcms_l) > 1 and len(x_lcms_r) > 1:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=x_lcms_l,
+                            y=lata_lcms_l,
+                            mode="lines",
+                            name="Łata LCMS Lewa",
+                            line=dict(color="mediumseagreen", width=2, dash="dash"),
+                        )
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=x_lcms_r,
+                            y=lata_lcms_r,
+                            mode="lines",
+                            name="Łata LCMS Prawa",
+                            line=dict(color="darkgreen", width=2, dash="dash"),
+                        )
+                    )
+
+                    # Odcinek maksymalnego zagłębienia LCMS Lewa
+                    x_lcms_kl = x_lcms_l[idx_max_lcms_l]
+                    z_lcms_kl_prof = z_lcms_l[idx_max_lcms_l]
+                    z_lcms_kl_lata = lata_lcms_l[idx_max_lcms_l]
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[x_lcms_kl, x_lcms_kl],
+                            y=[z_lcms_kl_lata, z_lcms_kl_prof],
+                            mode="lines+markers",
+                            name=f"LCMS Łata Lewa ({calc_lcms_rut_l:.1f} mm)",
+                            line=dict(color="mediumseagreen", width=2),
+                            marker=dict(size=5, symbol="triangle-down"),
+                        )
                     )
                     fig.add_annotation(
-                        x=0.8 + manual_x_shift_lcms,
-                        y=np.max(z_lcms_plot),
+                        x=x_lcms_kl,
+                        y=(z_lcms_kl_lata + z_lcms_kl_prof) / 2,
                         text=(
-                            f"<b>LCMS P: {disp_p:.1f} mm</b> (Δ"
-                            f" {koleina_prawa_mm - disp_p:+.1f} mm)"
+                            f"<b>Łata LCMS Lewa: {calc_lcms_rut_l:.1f}"
+                            f" mm</b><br>Klasa {get_dsn_class(calc_lcms_rut_l)}"
                         ),
-                        showarrow=False,
-                        font=dict(color="forestgreen", size=11),
+                        showarrow=True,
+                        arrowhead=2,
+                        arrowcolor="seagreen",
+                        font=dict(color="seagreen", size=10),
                         bgcolor="rgba(235, 255, 235, 0.95)",
-                        bordercolor="forestgreen",
+                        bordercolor="seagreen",
                         borderwidth=1,
+                        ax=-70,
+                        ay=35,
+                    )
+
+                    # Odcinek maksymalnego zagłębienia LCMS Prawa
+                    x_lcms_kp = x_lcms_r[idx_max_lcms_r]
+                    z_lcms_kp_prof = z_lcms_r[idx_max_lcms_r]
+                    z_lcms_kp_lata = lata_lcms_r[idx_max_lcms_r]
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[x_lcms_kp, x_lcms_kp],
+                            y=[z_lcms_kp_lata, z_lcms_kp_prof],
+                            mode="lines+markers",
+                            name=f"LCMS Łata Prawa ({calc_lcms_rut_r:.1f} mm)",
+                            line=dict(color="darkgreen", width=2),
+                            marker=dict(size=5, symbol="triangle-down"),
+                        )
+                    )
+                    fig.add_annotation(
+                        x=x_lcms_kp,
+                        y=(z_lcms_kp_lata + z_lcms_kp_prof) / 2,
+                        text=(
+                            f"<b>Łata LCMS Prawa: {calc_lcms_rut_r:.1f}"
+                            f" mm</b><br>Klasa {get_dsn_class(calc_lcms_rut_r)}"
+                        ),
+                        showarrow=True,
+                        arrowhead=2,
+                        arrowcolor="darkgreen",
+                        font=dict(color="darkgreen", size=10),
+                        bgcolor="rgba(235, 255, 235, 0.95)",
+                        bordercolor="darkgreen",
+                        borderwidth=1,
+                        ax=70,
+                        ay=35,
                     )
 
             fig.add_vline(
