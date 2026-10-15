@@ -7,6 +7,18 @@ import parsers
 import plotly.graph_objects as go
 import streamlit as st
 
+
+def sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Zabezpiecza ramki danych przed awariami PyArrow w Streamlit."""
+    if df is None or df.empty:
+        return df
+    df_clean = df.copy()
+    for col in df_clean.columns:
+        if df_clean[col].dtype == "object":
+            df_clean[col] = df_clean[col].astype(str)
+    return df_clean
+
+
 DEFAULT_RSP_X_STR = (
     "-1.610, -1.444, -1.285, -1.145, -1.007, -0.850, -0.700, -0.550, -0.400, "
     "-0.200, 0.000, 0.200, 0.400, 0.550, 0.700, 0.850, 1.003, 1.140, 1.280, "
@@ -14,9 +26,27 @@ DEFAULT_RSP_X_STR = (
 )
 
 DEFAULT_RSP_X_LIST = [
-    -1.610, -1.444, -1.285, -1.145, -1.007, -0.850, -0.700, -0.550, -0.400,
-    -0.200, 0.000, 0.200, 0.400, 0.550, 0.700, 0.850, 1.003, 1.140, 1.280,
-    1.440, 1.618
+    -1.610,
+    -1.444,
+    -1.285,
+    -1.145,
+    -1.007,
+    -0.850,
+    -0.700,
+    -0.550,
+    -0.400,
+    -0.200,
+    0.000,
+    0.200,
+    0.400,
+    0.550,
+    0.700,
+    0.850,
+    1.003,
+    1.140,
+    1.280,
+    1.440,
+    1.618,
 ]
 
 st.set_page_config(
@@ -681,7 +711,7 @@ if bytes_rsp is not None:
                 yaxis=dict(autorange=True if tryb_zero_l11 else "reversed"),
             )
             st.plotly_chart(
-                fig, use_container_width=True, key="fig_cross_section"
+                fig, width="stretch", key="fig_cross_section"
             )
 
             # WYKRES PODŁUŻNY CAŁEJ TRASY
@@ -749,7 +779,7 @@ if bytes_rsp is not None:
                     height=420,
                 )
                 st.plotly_chart(
-                    fig_m, use_container_width=True, key="fig_longitudinal_max"
+                    fig_m, width="stretch", key="fig_longitudinal_max"
                 )
 
         with tab_dsn50:
@@ -779,10 +809,10 @@ if bytes_rsp is not None:
                 charts.make_50m_bar_chart(
                     df_sec_dsn, "MAX_KOL", "Koleina Maksymalna (MAX_KOL)"
                 ),
-                use_container_width=True,
+                width="stretch",
                 key="fig_dsn_50m_bar",
             )
-            st.dataframe(df_sec_dsn, use_container_width=True)
+            st.dataframe(sanitize_df(df_sec_dsn), width="stretch")
 
         with tab_ba_gddkia:
             st.header("📈 Analiza Porównawcza LCMS vs RSP (Metodologia GDDKiA)")
@@ -795,9 +825,11 @@ if bytes_rsp is not None:
                     rsp_r_v, lcms_r_v, title="PRAWA KOLEINA (P_KOL)"
                 )
                 st.plotly_chart(
-                    fig_ba_r, use_container_width=True, key="fig_bland_altman"
+                    fig_ba_r, width="stretch", key="fig_bland_altman"
                 )
-                st.table(calc.build_rpd_table_df(rsp_r_v, lcms_r_v))
+                
+                rpd_tbl = calc.build_rpd_table_df(rsp_r_v, lcms_r_v)
+                st.table(sanitize_df(rpd_tbl))
             else:
                 st.warning(
                     "⚠️ Wgraj plik RSP oraz pliki LCMS, aby zobaczyć analizę"
