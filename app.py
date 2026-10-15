@@ -22,9 +22,23 @@ DEFAULT_RSP_X_LIST = [
 ]
 
 # ==========================================
+# FUNKCJA SANITYZACJI DATAFRAME DLA PYARROW
+# ==========================================
+def sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Zabezpiecza DataFrame przed błędami konwersji PyArrow (np. mieszanie int z '-')."""
+    if df is None or df.empty:
+        return df
+    df_clean = df.copy()
+    for col in df_clean.columns:
+        if df_clean[col].dtype == "object":
+            df_clean[col] = df_clean[col].astype(str)
+    return df_clean
+
+# ==========================================
 # 1. FUNKCJE POMOCNICZE DSN 2019 I KLASYFIKACJI
 # ==========================================
 def get_dsn_class(h_val):
+    if h_val is None or np.isnan(h_val): return "A"
     if h_val < 11.0: return "A"
     elif h_val < 21.0: return "B"
     elif h_val < 31.0: return "C"
@@ -478,16 +492,28 @@ def build_rpd_table_df(rsp_v, lcms_v):
     def sub_stat(m_grp, label):
         n_grp = int(np.sum(m_grp))
         if n_grp == 0:
-            return {"zakres RPD": label, "n": 0, "%": "0%", "RSP > LCMS": 0, "Wyniki równe": 0, "LCMS > RSP": 0, "%RSP > LCMS": "0%", "%Wyniki równe": "0%", "%LCMS > RSP": "0%"}
+            return {
+                "zakres RPD": label, "n": "0", "%": "0%", 
+                "RSP > LCMS": "0", "Wyniki równe": "0", "LCMS > RSP": "0", 
+                "%RSP > LCMS": "0%", "%Wyniki równe": "0%", "%LCMS > RSP": "0%"
+            }
         r_sub, l_sub = np.round(rsp_v[m_grp], 1), np.round(lcms_v[m_grp], 1)
         rsp_gt, eq, lcms_gt = int(np.sum(r_sub > l_sub)), int(np.sum(r_sub == l_sub)), int(np.sum(l_sub > r_sub))
         return {
-            "zakres RPD": label, "n": n_grp, "%": f"{(n_grp / n_tot)*100:.0f}%",
-            "RSP > LCMS": rsp_gt, "Wyniki równe": eq, "LCMS > RSP": lcms_gt,
+            "zakres RPD": label, "n": str(n_grp), "%": f"{(n_grp / n_tot)*100:.0f}%",
+            "RSP > LCMS": str(rsp_gt), "Wyniki równe": str(eq), "LCMS > RSP": str(lcms_gt),
             "%RSP > LCMS": f"{(rsp_gt / n_grp)*100:.0f}%", "%Wyniki równe": f"{(eq / n_grp)*100:.0f}%", "%LCMS > RSP": f"{(lcms_gt / n_grp)*100:.0f}%"
         }
 
-    return pd.DataFrame([sub_stat(m_low, "0-30%"), sub_stat(m_high, ">30%"), {"zakres RPD": "suma", "n": n_tot, "%": "100%", "RSP > LCMS": "-", "Wyniki równe": "-", "LCMS > RSP": "-", "%RSP > LCMS": "-", "%Wyniki równe": "-", "%LCMS > RSP": "-"}])
+    return pd.DataFrame([
+        sub_stat(m_low, "0-30%"), 
+        sub_stat(m_high, ">30%"), 
+        {
+            "zakres RPD": "suma", "n": str(n_tot), "%": "100%", 
+            "RSP > LCMS": "-", "Wyniki równe": "-", "LCMS > RSP": "-", 
+            "%RSP > LCMS": "-", "%Wyniki równe": "-", "%LCMS > RSP": "-"
+        }
+    ])
 
 def compute_50m_dsn_sections_full(df_ruts, step_m=1.0, section_m=50.0):
     profs_per_sec = max(1, int(round(section_m / step_m)))
@@ -811,7 +837,7 @@ if bytes_rsp is not None:
 
             fig.add_vline(x=0, line_width=1, line_dash="dot", line_color="gray", annotation_text="Oś L11 (0.0 m)")
             fig.update_layout(title=f"Przekrój Poprzeczny – Profil RSP nr {wybrany_profil}", xaxis_title="Pozycja czujnika na belce [m]", yaxis_title=y_label, height=580, hovermode="x unified", xaxis=dict(range=[-1.85, 1.85], dtick=0.2), yaxis=dict(autorange=True if tryb_zero_l11 else "reversed"))
-            st.plotly_chart(fig, use_container_width=True, key="fig_cross_section")
+            st.plotly_chart(fig, width="stretch", key="fig_cross_section")
 
             # WYKRES PODŁUŻNY
             st.markdown("---")
@@ -830,7 +856,7 @@ if bytes_rsp is not None:
                 fig_m.add_trace(go.Scatter(x=lcms_p_shifted, y=np.maximum(lcms_file_rut_l, lcms_file_rut_r), mode="lines", name="LCMS Scalone Pliki Max", line=dict(color="forestgreen", width=2.5)))
                 fig_m.add_vline(x=wybrany_profil, line_width=2, line_color="red", annotation_text=f"Profil {wybrany_profil}")
                 fig_m.update_layout(title="KOLEINA MAKSYMALNA NA CAŁEJ TRASIE [mm]", xaxis_title="Numer Profilu RSP", yaxis_title="Koleina [mm]", height=420)
-                st.plotly_chart(fig_m, use_container_width=True, key="fig_longitudinal_max")
+                st.plotly_chart(fig_m, width="stretch", key="fig_longitudinal_max")
 
         with tab_dsn50:
             st.header("📊 Ocena Stanu Koleiny dla Odcinków 50-metrowych (DSN 2019)")
@@ -845,16 +871,19 @@ if bytes_rsp is not None:
                 df_merged_ruts = pd.merge(df_merged_ruts, df_lcms_sub, on="Profil", how="inner")
 
             df_sec_dsn = compute_50m_dsn_sections_full(df_merged_ruts, step_m=1.0, section_m=50.0)
-            st.plotly_chart(make_50m_bar_chart(df_sec_dsn, "MAX_KOL", "Koleina Maksymalna (MAX_KOL)"), use_container_width=True, key="fig_dsn_50m_bar")
-            st.dataframe(df_sec_dsn, use_container_width=True)
+            st.plotly_chart(make_50m_bar_chart(df_sec_dsn, "MAX_KOL", "Koleina Maksymalna (MAX_KOL)"), width="stretch", key="fig_dsn_50m_bar")
+            st.dataframe(sanitize_df(df_sec_dsn), width="stretch")
 
         with tab_ba_gddkia:
             st.header("📈 Analiza Porównawcza LCMS vs RSP (Metodologia GDDKiA)")
             if lcms_profiles and "LCMS_Rut_L" in df_merged_ruts.columns:
                 rsp_r_v, lcms_r_v = df_merged_ruts["RSP_Rut_R"].values, df_merged_ruts["LCMS_Rut_R"].values
                 fig_ba_r, _, _, _, _ = build_bland_altman_fig(rsp_r_v, lcms_r_v, title="PRAWA KOLEINA (P_KOL)")
-                st.plotly_chart(fig_ba_r, use_container_width=True, key="fig_bland_altman")
-                st.table(build_rpd_table_df(rsp_r_v, lcms_r_v))
+                st.plotly_chart(fig_ba_r, width="stretch", key="fig_bland_altman")
+                
+                # Bezpieczne wyświetlenie tabeli z wymuszonym brakiem konfliktu typów
+                rpd_table = build_rpd_table_df(rsp_r_v, lcms_r_v)
+                st.table(sanitize_df(rpd_table))
             else:
                 st.warning("⚠️ Wgraj plik RSP oraz pliki LCMS, aby zobaczyć analizę Blanda-Altmana.")
 
