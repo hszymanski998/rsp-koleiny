@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 # ==========================================
-# 1. DOKŁADNA GEOMETRIA LASERÓW RSP [m]
+# DOKŁADNA GEOMETRIA LASERÓW RSP [m]
 # ==========================================
 DEFAULT_RSP_X_STR = (
     "-1.610, -1.444, -1.285, -1.145, -1.007, -0.850, -0.700, -0.550, -0.400, "
@@ -17,8 +17,112 @@ DEFAULT_RSP_X_STR = (
 
 
 # ==========================================
-# 2. FUNKCJE GEODEZYJNE I MATEMATYCZNE
+# 1. PARSERY SUROWYCH PLIKÓW (.RSP, .GPX, .XML)
 # ==========================================
+def parse_native_rsp_file(file_bytes):
+    """Parsuje surowy plik Dynatest .rsp / .txt (linie 5201-5221, 5401, 5280)."""
+    text = file_bytes.decode("utf-8", errors="ignore")
+    lines = text.strip().split("\n")
+
+    sensors = []
+    profiles_data = []
+    gps_data = []
+
+    for line in lines:
+        parts = [p.strip().strip('"') for p in line.split(",")]
+        if not parts or not parts[0]:
+            continue
+        code = parts[0]
+
+        # 5201-5221: Konfiguracja czujników X [mm]
+        if code.isdigit() and 5201 <= int(code) <= 5221:
+            try:
+                x_mm = float(parts[-1])
+                sensors.append((int(code), x_mm / 1000.0))
+            except ValueError:
+                pass
+
+        # 5401: Odczyty profilu poprzecznego (21 laserów [mm])
+        elif code == "5401":
+            try:
+                readings = [float(x) for x in parts[3:24]]
+                profiles_data.append([len(profiles_data) + 1] + readings)
+            except (ValueError, IndexError):
+                pass
+
+        # 5280: Pozycje GPS w pliku RSP
+        elif code == "5280":
+            try:
+                st_m = float(parts[1])
+                lat = float(parts[5])
+                lon = float(parts[6])
+                ele = float(parts[7])
+                gps_data.append({
+                    "Km": st_m,
+                    "LAT": lat,
+                    "LON": lon,
+                    "ELE": ele,
+                    "Profil_idx": len(gps_data) + 1,
+                })
+            except (ValueError, IndexError):
+                pass
+
+    df_prof = None
+    if profiles_data:
+        cols = ["Profil"] + [f"L{i+1}" for i in range(21)]
+        df_prof = pd.DataFrame(profiles_data, columns=cols)
+
+    df_gps = pd.DataFrame(gps_data) if gps_data else None
+
+    x_positions = (
+        [s[1] for s in sorted(sensors, key=lambda x: x[0])]
+        if len(sensors) == 21
+        else None
+    )
+
+    return df_prof, df_gps, x_positions
+
+
+def parse_gpx_cached(file_bytes):
+    """Parsuje pliki GPX śladu GPS z profilografu RSP."""
+    try:
+        tree = ET.ElementTree(ET.fromstring(file_bytes))
+        root = tree.getroot()
+
+        for elem in root.iter():
+            if "}" in elem.tag:
+                elem.tag = elem.tag.split("}", 1)[1]
+
+        records = []
+        for tag in ["rtept", "trkpt", "wpt"]:
+            for pt in root.iter(tag):
+                try:
+                    lat = float(pt.attrib.get("lat"))
+                    lon = float(pt.attrib.get("lon"))
+                    ele_str = pt.findtext("ele")
+                    ele = float(ele_str) if ele_str else 0.0
+                    name = pt.findtext("name")
+                    clean_km = (
+                        float(name)
+                        if name
+                        and name.replace(".", "", 1).replace("-", "").isdigit()
+                        else len(records) + 1
+                    )
+                    records.append({
+                        "LAT": lat,
+                        "LON": lon,
+                        "ELE": ele,
+                        "Km": clean_km,
+                        "Profil_idx": len(records) + 1,
+                    })
+                except (ValueError, TypeError):
+                    continue
+
+        return pd.DataFrame(records) if records else None
+    except Exception:
+        return None
+
+
 def haversine_distance_m(lat1, lon1, lat2, lon2):
     """Oblicza odległość w metrach na elipsoidzie WGS84."""
     R = 6371000.0
@@ -33,7 +137,7 @@ def haversine_distance_m(lat1, lon1, lat2, lon2):
 
 
 def get_file_bytes_and_name(uploaded_file, default_paths):
-    """Pobiera plik z uploadu lub lokalnego folderu data/."""
+    """Pobiera plik z uploadu lub domyślny z folderu data/."""
     if uploaded_file is not None:
         return uploaded_file.getvalue(), uploaded_file.name
 
@@ -46,7 +150,12 @@ def get_file_bytes_and_name(uploaded_file, default_paths):
 
 @st.cache_data
 def load_rsp_data(file_bytes, file_name):
-    """Wczytuje i keszuje dane RSP."""
+    """Wczytuje i keszuje dane RSP (zarówno Excel/CSV jak i surowy .rsp)."""
+    if file_name.lower().endswith(".rsp") or file_name.lower().endswith(".txt"):
+        df_prof, _, _ = parse_native_rsp_file(file_bytes)
+        if df_prof is not None:
+            return df_prof
+
     if file_name.lower().endswith(".csv"):
         df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python")
     else:
@@ -57,7 +166,17 @@ def load_rsp_data(file_bytes, file_name):
 
 @st.cache_data
 def parse_rsp_gps_cached(file_bytes, file_name):
-    """Szybki parser GPS z RSP."""
+    """Parser GPS z plików GPX / RSP / CSV / Excel."""
+    if file_name.lower().endswith(".gpx"):
+        df_gpx = parse_gpx_cached(file_bytes)
+        if df_gpx is not None:
+            return df_gpx
+
+    if file_name.lower().endswith(".rsp") or file_name.lower().endswith(".txt"):
+        _, df_gps, _ = parse_native_rsp_file(file_bytes)
+        if df_gps is not None:
+            return df_gps
+
     if file_name.lower().endswith(".csv") or file_name.lower().endswith(".txt"):
         try:
             df = pd.read_csv(
@@ -211,7 +330,7 @@ def parse_lcms_excel_cached(file_bytes, file_name):
 
 @st.cache_data
 def parse_lcms_xml(file_bytes):
-    """Parser XML z LCMS ze ścisłym sortowaniem po pikietażu (bez powrotnych prostej na mapie)."""
+    """Parser XML z LCMS ze ścisłym sortowaniem po pikietażu."""
     tree = ET.ElementTree(ET.fromstring(file_bytes))
     root = tree.getroot()
 
@@ -247,7 +366,7 @@ def parse_lcms_xml(file_bytes):
 
 
 def smooth_profile(z_vals, window_size=31):
-    """Filtruje makrostrukturę kruszywa."""
+    """Filtruje makrostrukturę nawierzchni."""
     if len(z_vals) < window_size:
         return z_vals
     return (
@@ -277,7 +396,7 @@ def get_upper_hull_pts(x_sec, y_sec):
 
 
 def get_upper_hull(x_sec, y_sec):
-    """Oblicza proste łaty DSN 2019."""
+    """Interpolacja wartości prostej łaty DSN 2019."""
     upper = get_upper_hull_pts(x_sec, y_sec)
     x_h = [p[0] for p in upper]
     y_h = [p[1] for p in upper]
@@ -320,29 +439,30 @@ def compute_all_rsp_ruts_cached(df_rsp, x_vals_tuple):
     })
 
 
-def auto_align_offset(rsp_series, lcms_series, max_search=150):
-    """Automatycznie dopasowuje przesunięcie pikietażu po korelacji szczytów kolein."""
-    r = rsp_series - np.mean(rsp_series)
-    l = lcms_series - np.mean(lcms_series)
+def auto_align_offset_clean(rsp_s, lcms_s, max_search=100):
+    """Automatycznie dopasowuje pikietaż na podstawie korelacji wykresu kolein."""
+    r = np.array(rsp_s) - np.mean(rsp_s)
+    l = np.array(lcms_s) - np.mean(lcms_s)
 
     best_offset = 0
     max_corr = -1e9
 
     for offset in range(-max_search, max_search + 1):
         if offset >= 0:
-            r_sub = r[: len(l) - offset] if len(l) - offset < len(r) else r
+            r_sub = r[: len(r) - offset] if offset < len(r) else r[:0]
             l_sub = l[offset : offset + len(r_sub)]
         else:
-            l_sub = l[: len(r) + offset]
-            r_sub = r[-offset : -offset + len(l_sub)]
+            abs_off = abs(offset)
+            r_sub = r[abs_off:]
+            l_sub = l[: len(r_sub)]
 
-        if len(r_sub) > 20:
-            corr = np.sum(r_sub * l_sub) / (
-                np.linalg.norm(r_sub) * np.linalg.norm(l_sub) + 1e-9
-            )
-            if corr > max_corr:
-                max_corr = corr
-                best_offset = offset
+        if len(r_sub) > 10 and len(r_sub) == len(l_sub):
+            denom = np.linalg.norm(r_sub) * np.linalg.norm(l_sub)
+            if denom > 1e-9:
+                corr = np.sum(r_sub * l_sub) / denom
+                if corr > max_corr:
+                    max_corr = corr
+                    best_offset = offset
 
     return best_offset
 
@@ -371,29 +491,28 @@ def make_map_trace(
 
 
 # ==========================================
-# 3. KONFIGURACJA STRONY
+# 2. KONFIGURACJA STRONY STREAMLIT
 # ==========================================
 st.set_page_config(
     page_title="RSP vs LCMS – Szybka Analiza Kolein", layout="wide"
 )
 st.title("⚡ System Analizy RSP + LCMS (DSN 2019)")
 
-# inicjalizacja stanu przesunięcia pikietażu
-if "offset_pikitaz" not in st.session_state:
-    st.session_state["offset_pikitaz"] = 0
-if "fine_offset" not in st.session_state:
-    st.session_state["fine_offset"] = 0.0
+if "offset_pikitaz_input" not in st.session_state:
+    st.session_state["offset_pikitaz_input"] = 0.0
 
 # ==========================================
-# 4. PANEL BOCZNY
+# 3. PANEL BOCZNY (PRZEPISANE DANE I SYNCHRONIZACJA)
 # ==========================================
-st.sidebar.header("1. Dane RSP (Profilograf)")
+st.sidebar.header("1. Dane RSP (Profilograf / Surowe)")
 uploaded_rsp = st.sidebar.file_uploader(
-    "Wgraj plik RSP (.xlsx / .csv)", type=["xlsx", "csv"], key="rsp_input"
+    "Wgraj plik RSP (.rsp / .xlsx / .csv / .txt)",
+    type=["rsp", "xlsx", "csv", "txt"],
+    key="rsp_input",
 )
 uploaded_rsp_gps = st.sidebar.file_uploader(
-    "Wgraj plik GPS RSP (.xlsx / .csv / .txt)",
-    type=["xlsx", "csv", "txt"],
+    "Wgraj plik GPS RSP (.gpx / .rsp / .csv / .txt)",
+    type=["gpx", "rsp", "xlsx", "csv", "txt"],
     key="rsp_gps_input",
 )
 
@@ -405,18 +524,25 @@ uploaded_xml = st.sidebar.file_uploader(
     "Wgraj plik XML z LCMS (GPS)", type=["xml"], key="xml_input"
 )
 
-# Pobieranie z uploadu lub lokalnego repozytorium
 bytes_rsp, name_rsp = get_file_bytes_and_name(
-    uploaded_rsp, ["data/rsp.xlsx", "data/rsp.csv", "rsp.xlsx", "rsp.csv"]
+    uploaded_rsp,
+    [
+        "data/rsp.rsp",
+        "data/rsp.xlsx",
+        "data/rsp.csv",
+        "rsp.rsp",
+        "rsp.xlsx",
+        "rsp.csv",
+    ],
 )
 bytes_rsp_gps, name_rsp_gps = get_file_bytes_and_name(
     uploaded_rsp_gps,
     [
+        "data/rsp_gps.gpx",
         "data/rsp_gps.csv",
         "data/rsp_gps.xlsx",
-        "data/rsp_gps.txt",
+        "rsp_gps.gpx",
         "rsp_gps.csv",
-        "rsp_gps.xlsx",
     ],
 )
 bytes_lcms, name_lcms = get_file_bytes_and_name(
@@ -426,37 +552,52 @@ bytes_xml, name_xml = get_file_bytes_and_name(
     uploaded_xml, ["data/lcms.xml", "lcms.xml"]
 )
 
-if uploaded_rsp is None and bytes_rsp is not None:
-    st.sidebar.info(f"ℹ️ Wczytano automatycznie plik RSP: `{name_rsp}`")
+# Automatyczny odczyt czujników z surowego RSP
+auto_x_from_rsp = None
+if bytes_rsp is not None and (
+    name_rsp.lower().endswith(".rsp") or name_rsp.lower().endswith(".txt")
+):
+    _, _, auto_x_from_rsp = parse_native_rsp_file(bytes_rsp)
 
-st.sidebar.header("3. Synchronizacja i Pikietaż (Drift)")
-st.session_state["offset_pikitaz"] = st.sidebar.slider(
-    "Zgrubne przesunięcie LCMS względem RSP [liczba profili]:",
-    min_value=-200,
-    max_value=200,
-    value=st.session_state["offset_pikitaz"],
-    step=1,
-)
-st.session_state["fine_offset"] = st.sidebar.number_input(
-    "Precyzyjne dociągnięcie pikietażu [metry / ułamek profilu]:",
-    min_value=-20.0,
-    max_value=20.0,
-    value=float(st.session_state["fine_offset"]),
+st.sidebar.header("3. Synchronizacja i Pikietaż (Wpisz wartość)")
+glowny_offset = st.sidebar.number_input(
+    "Wpisz przesunięcie LCMS względem RSP [metry / profili]:",
+    min_value=-500.0,
+    max_value=500.0,
+    value=float(st.session_state["offset_pikitaz_input"]),
     step=0.1,
     format="%.1f",
+    key="offset_pikitaz_input",
 )
+
+podziel_na_sekcje = st.sidebar.checkbox(
+    "Dziel trasę na sekcje (osobne przesunięcia dla odcinków)", value=False
+)
+sekcja_m = 500
+sekcje_offsets = {}
+
+if podziel_na_sekcje:
+    sekcja_m = st.sidebar.select_slider(
+        "Długość pojedynczej sekcji pikietażu [m]:",
+        options=[250, 500, 1000, 2000],
+        value=500,
+    )
+    st.sidebar.markdown("##### Ręczne offsety dla poszczególnych sekcji:")
 
 st.sidebar.header("4. Geometria Belki RSP")
 typ_geometrii = st.sidebar.radio(
     "Typ konfiguracji czujników RSP:",
-    ["Domyślny rozstaw RSP (21 czujników)", "Stały odstęp (równomierny)"],
+    ["Wprowadzona w pliku / Domyślna RSP", "Stały odstęp (równomierny)"],
 )
 
-if typ_geometrii == "Domyślny rozstaw RSP (21 czujników)":
+if typ_geometrii == "Wprowadzona w pliku / Domyślna RSP":
+    default_x_val = (
+        ", ".join(f"{x:.3f}" for x in auto_x_from_rsp)
+        if auto_x_from_rsp
+        else DEFAULT_RSP_X_STR
+    )
     x_input_str = st.sidebar.text_area(
-        "Pozycje X [m] dla 21 laserów (rozdzielone przecinkami):",
-        value=DEFAULT_RSP_X_STR,
-        height=100,
+        "Pozycje X [m] dla 21 laserów:", value=default_x_val, height=90
     )
     try:
         pozycja_x = [
@@ -465,7 +606,7 @@ if typ_geometrii == "Domyślny rozstaw RSP (21 czujników)":
             if val.strip() != ""
         ]
     except Exception:
-        pozycja_x = [
+        pozycja_x = auto_x_from_rsp or [
             -1.610,
             -1.444,
             -1.285,
@@ -509,7 +650,22 @@ zrodlo_lcms = st.sidebar.radio(
     ],
 )
 
-st.sidebar.header("6. Opcje Wykresu Poprzecznego")
+st.sidebar.header("6. Geometria i Dopasowanie Poprzeczne LCMS vs RSP")
+zaczep_prawa_krawedz = st.sidebar.checkbox(
+    "🔗 Zaczep prawą krawędź LCMS do krawędzi RSP", value=True
+)
+skaluj_szerokosc = st.sidebar.checkbox(
+    "📐 Skaluj szerokość LCMS do szerokości belki RSP", value=False
+)
+manual_x_shift_lcms = st.sidebar.number_input(
+    "Ręczne przesunięcie poprzeczne X LCMS [m]:",
+    min_value=-2.0,
+    max_value=2.0,
+    value=0.0,
+    step=0.01,
+    format="%.2f",
+)
+
 test_stacjonarny = st.sidebar.checkbox(
     "Tryb testu stacjonarnego (Łata 0)", value=False
 )
@@ -548,7 +704,7 @@ if bytes_xml is not None:
         st.sidebar.error(f"Błąd XML: {e}")
 
 # ==========================================
-# 5. GŁÓWNA LOGIKA ANALIZY I WYKRESÓW
+# 4. GŁÓWNA LOGIKA ANALIZY I WYKRESÓW
 # ==========================================
 if bytes_rsp is not None:
     df_rsp = load_rsp_data(bytes_rsp, name_rsp)
@@ -556,6 +712,20 @@ if bytes_rsp is not None:
     col_profil = "Profil" if "Profil" in df_rsp.columns else df_rsp.columns[0]
     min_p = int(df_rsp[col_profil].min())
     max_p = int(df_rsp[col_profil].max())
+
+    if podziel_na_sekcje:
+        num_sekcji = int(np.ceil((max_p - min_p + 1) / sekcja_m))
+        for s_i in range(num_sekcji):
+            p_start_s = min_p + s_i * sekcja_m
+            p_end_s = min(max_p, p_start_s + sekcja_m - 1)
+            sekcje_offsets[s_i] = st.sidebar.number_input(
+                f"Sekcja {s_i+1} ({p_start_s}-{p_end_s}m) [m]:",
+                min_value=-100.0,
+                max_value=100.0,
+                value=0.0,
+                step=0.1,
+                format="%.1f",
+            )
 
     st.sidebar.header("7. Wybór profilu")
     wybrany_profil = st.sidebar.number_input(
@@ -566,12 +736,17 @@ if bytes_rsp is not None:
         step=1,
     )
 
-    całkowity_offset = (
-        st.session_state["offset_pikitaz"] + st.session_state["fine_offset"]
-    )
+    bazowy_offset = glowny_offset
+    if podziel_na_sekcje:
+        idx_s = int((wybrany_profil - min_p) // sekcja_m)
+        dodatkowy_s_offset = sekcje_offsets.get(idx_s, 0.0)
+    else:
+        dodatkowy_s_offset = 0.0
+
+    całkowity_offset = bazowy_offset + dodatkowy_s_offset
     wybrany_profil_lcms = int(round(wybrany_profil + całkowity_offset))
 
-    # Przycisk Automatycznej Synchronizacji
+    # AUTOMATYCZNA SYNCHRONIZACJA BAZUJĄCA NA WYKRESIE BIEGU KOLEIN
     if lcms_profiles is not None:
         df_all_rsp_ruts = compute_all_rsp_ruts_cached(df_rsp, tuple(pozycja_x))
         list_lcms_p = sorted(lcms_profiles.keys())
@@ -581,13 +756,12 @@ if bytes_rsp is not None:
         )
 
         if st.sidebar.button("⚡ Automatyczna Synchronizacja Pikietażu"):
-            sug_offset = auto_align_offset(
+            sug_offset = auto_align_offset_clean(
                 df_all_rsp_ruts["RSP_Rut_Max"].values, lcms_file_rut_max
             )
-            st.session_state["offset_pikitaz"] = sug_offset
-            st.session_state["fine_offset"] = 0.0
+            st.session_state["offset_pikitaz_input"] = float(sug_offset)
             st.sidebar.success(
-                f"✅ Automatycznie dopasowano przesunięcie: {sug_offset:+} profili!"
+                f"✅ Wyrysowano optymalne przesunięcie pikietażu: {sug_offset:+} m"
             )
             st.rerun()
 
@@ -667,12 +841,10 @@ if bytes_rsp is not None:
 
         st.subheader(
             f"Profil RSP nr {wybrany_profil} (LCMS nr {wybrany_profil_lcms},"
-            f" przesunięcie: {całkowity_offset:+.1f} profili)"
+            f" przesunięcie: {całkowity_offset:+.1f} m)"
         )
 
-        # ---------------------------------------------------------
-        # KAFELKI INFORMACYJNE: RSP U GÓRY, LCMS POD SPODEM
-        # ---------------------------------------------------------
+        # KAFELKI INFORMACYJNE (RSP U GÓRY, LCMS POD SPODEM)
         st.markdown("##### 🟦 Dane z Profilografu RSP")
         rc1, rc2, rc3 = st.columns(3)
         rc1.metric(
@@ -709,9 +881,7 @@ if bytes_rsp is not None:
         else:
             lc1.info("Brak profilu LCMS dla wybranego pikietażu.")
 
-        # ---------------------------------------------------------
         # WYKRES PRZEKROJU POPRZECZNEGO
-        # ---------------------------------------------------------
         fig = go.Figure()
 
         # Profil RSP (Zaokrąglona linia Spline)
@@ -749,7 +919,7 @@ if bytes_rsp is not None:
                 )
             )
 
-            # Etykieta RSP LEWA -> Po lewej stronie kreski (xanchor='right')
+            # Etykieta RSP LEWA
             x_kl, y_kl_prof, y_kl_lata = (
                 x_vals[idx_kol_l],
                 y_vals[idx_kol_l],
@@ -777,7 +947,7 @@ if bytes_rsp is not None:
                 xanchor="right",
             )
 
-            # Etykieta RSP PRAWA -> Po lewej stronie kreski (xanchor='right')
+            # Etykieta RSP PRAWA
             x_kp, y_kp_prof, y_kp_lata = (
                 x_vals[idx_kol_p],
                 y_vals[idx_kol_p],
@@ -805,24 +975,42 @@ if bytes_rsp is not None:
                 xanchor="right",
             )
 
-        # Obróbka i Łata LCMS (OBLIJANIE PRZED PRZEKRĘCENIEM PROFILU)
+        # Obróbka i Łata LCMS
         if prof_lcms_data is not None:
-            x_lcms_raw = prof_lcms_data["x"]
+            x_lcms_orig = prof_lcms_data["x"].copy()
             z_lcms_raw = prof_lcms_data["z"]
             z_lcms_smooth = smooth_profile(z_lcms_raw, window_size=31)
 
-            # 1. PRZYŁOŻENIE ŁATY NA NIEPRZEKRĘCONYM SUROWYM PROFILU LCMS
-            mid_mask_raw = (x_lcms_raw >= -0.5) & (x_lcms_raw <= 0.5)
+            # Przekształcenia Geometrii Poprzecznej LCMS vs RSP
+            x_lcms = x_lcms_orig.copy()
+            rsp_x_max = np.max(x_vals)
+            rsp_x_min = np.min(x_vals)
+
+            if skaluj_szerokosc and len(x_lcms) > 1:
+                rsp_w = rsp_x_max - rsp_x_min
+                lcms_w = np.max(x_lcms) - np.min(x_lcms)
+                x_lcms = rsp_x_min + (x_lcms - np.min(x_lcms)) * (
+                    rsp_w / lcms_w
+                )
+
+            if zaczep_prawa_krawedz and len(x_lcms) > 0:
+                shift_right = rsp_x_max - np.max(x_lcms)
+                x_lcms = x_lcms + shift_right
+
+            x_lcms = x_lcms + manual_x_shift_lcms
+
+            # Obliczanie łaty PRZED obracaniem profilu
+            mid_mask_raw = (x_lcms >= -0.5) & (x_lcms <= 0.5)
             if np.any(mid_mask_raw):
                 idx_crown_lcms = np.where(mid_mask_raw)[0][
                     np.argmax(z_lcms_smooth[mid_mask_raw])
                 ]
             else:
-                idx_crown_lcms = np.argmin(np.abs(x_lcms_raw))
+                idx_crown_lcms = np.argmin(np.abs(x_lcms))
 
-            x_lcms_l = x_lcms_raw[: idx_crown_lcms + 1]
+            x_lcms_l = x_lcms[: idx_crown_lcms + 1]
             z_lcms_l_raw = z_lcms_smooth[: idx_crown_lcms + 1]
-            x_lcms_r = x_lcms_raw[idx_crown_lcms:]
+            x_lcms_r = x_lcms[idx_crown_lcms:]
             z_lcms_r_raw = z_lcms_smooth[idx_crown_lcms:]
 
             lata_raw_l = get_upper_hull(x_lcms_l, z_lcms_l_raw)
@@ -831,10 +1019,9 @@ if bytes_rsp is not None:
             calc_lcms_rut_l = float(np.max(lata_raw_l - z_lcms_l_raw))
             calc_lcms_rut_r = float(np.max(lata_raw_r - z_lcms_r_raw))
 
-            # 2. EWENTUALNE POZIOMOWANIE PROFILU I ŁATY DO WYŚWIETLENIA
-            if wyrownaj_spadek_lcms and len(x_lcms_raw) > 10:
-                p_trend = np.polyfit(x_lcms_raw, z_lcms_smooth, 1)
-                trend_line = p_trend[0] * x_lcms_raw
+            if wyrownaj_spadek_lcms and len(x_lcms) > 10:
+                p_trend = np.polyfit(x_lcms, z_lcms_smooth, 1)
+                trend_line = p_trend[0] * x_lcms
                 z_lcms_leveled = z_lcms_smooth - trend_line
                 lata_plot_l = lata_raw_l - trend_line[: idx_crown_lcms + 1]
                 lata_plot_r = lata_raw_r - trend_line[idx_crown_lcms:]
@@ -843,7 +1030,7 @@ if bytes_rsp is not None:
                 lata_plot_l = lata_raw_l
                 lata_plot_r = lata_raw_r
 
-            idx_mid_lcms = np.argmin(np.abs(x_lcms_raw))
+            idx_mid_lcms = np.argmin(np.abs(x_lcms))
             z_ref_lcms = z_lcms_leveled[idx_mid_lcms]
 
             z_lcms_plot = z_lcms_leveled - z_ref_lcms
@@ -852,7 +1039,7 @@ if bytes_rsp is not None:
 
             fig.add_trace(
                 go.Scatter(
-                    x=x_lcms_raw,
+                    x=x_lcms,
                     y=z_lcms_plot,
                     mode="lines",
                     name=f"Profil LCMS nr {wybrany_profil_lcms}",
@@ -880,7 +1067,7 @@ if bytes_rsp is not None:
                     )
                 )
 
-                # Etykieta LCMS LEWA -> Po prawej stronie kreski (xanchor='left')
+                # Etykieta LCMS LEWA
                 diff_lcms_l = lata_plot_l_zero - (
                     z_lcms_plot[: idx_crown_lcms + 1]
                 )
@@ -911,11 +1098,11 @@ if bytes_rsp is not None:
                     xanchor="left",
                 )
 
-                # Etykieta LCMS PRAWA -> Po prawej stronie kreski (xanchor='left')
+                # Etykieta LCMS PRAWA
                 diff_lcms_r = lata_plot_r_zero - (z_lcms_plot[idx_crown_lcms:])
                 idx_k_r_c_rel = np.argmax(diff_lcms_r)
                 idx_k_r_c = idx_crown_lcms + idx_k_r_c_rel
-                x_kp_c = x_lcms_raw[idx_k_r_c]
+                x_kp_c = x_lcms[idx_k_r_c]
                 y_kp_c_prof = z_lcms_plot[idx_k_r_c]
                 y_kp_c_lata = lata_plot_r_zero[idx_k_r_c_rel]
 
@@ -961,9 +1148,7 @@ if bytes_rsp is not None:
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # ---------------------------------------------------------
         # WYKRESY PODŁUŻNE NA CAŁEJ TRASIE
-        # ---------------------------------------------------------
         st.markdown("---")
         st.subheader("📈 Przebieg Kolein na Całej Trasie (RSP vs LCMS)")
 
@@ -975,7 +1160,16 @@ if bytes_rsp is not None:
             lcms_file_rut_l = [lcms_profiles[p]["rut_l"] for p in list_lcms_p]
             lcms_file_rut_r = [lcms_profiles[p]["rut_r"] for p in list_lcms_p]
             lcms_file_rut_max = np.maximum(lcms_file_rut_l, lcms_file_rut_r)
-            lcms_p_shifted = [p - całkowity_offset for p in list_lcms_p]
+
+            # Uwzględnienie przesunięć sekcyjnych
+            lcms_p_shifted = []
+            for p in list_lcms_p:
+                if podziel_na_sekcje:
+                    idx_s_p = int((p - min_p) // sekcja_m)
+                    off_s = bazowy_offset + sekcje_offsets.get(idx_s_p, 0.0)
+                else:
+                    off_s = bazowy_offset
+                lcms_p_shifted.append(p - off_s)
 
         tab_l, tab_r, tab_max, tab_all = st.tabs([
             "👈 Koleina Lewa",
@@ -1157,12 +1351,10 @@ if bytes_rsp is not None:
             )
             st.plotly_chart(fig_all, use_container_width=True)
 
-        # ---------------------------------------------------------
         # MAPA GPS
-        # ---------------------------------------------------------
         if df_rsp_gps is not None or df_xml_gps is not None:
             st.markdown("---")
-            st.subheader("MAPA GPS i Przesunięcie Terenowe")
+            st.subheader("🗺️ MAPA GPS i Przesunięcie Terenowe")
 
             idx_rsp_gps = (
                 min(max(0, wybrany_profil - min_p), len(df_rsp_gps) - 1)
@@ -1209,11 +1401,11 @@ if bytes_rsp is not None:
                 mc1.metric(
                     "Odległość GPS (Obecny Offset)",
                     f"{dist_m:.2f} m",
-                    delta=f"Przesunięcie: {całkowity_offset:+.1f} profili",
+                    delta=f"Przesunięcie: {całkowity_offset:+.1f} m",
                 )
                 mc2.metric(
                     "Sugerowany Offset Przestrzenny",
-                    f"{sugerowany_offset:+} profili",
+                    f"{sugerowany_offset:+} m",
                     delta_color="normal",
                 )
                 mc3.metric(
