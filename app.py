@@ -23,27 +23,9 @@ DEFAULT_RSP_X_STR = (
 )
 
 DEFAULT_RSP_X_LIST = [
-    -1.610,
-    -1.444,
-    -1.285,
-    -1.145,
-    -1.007,
-    -0.850,
-    -0.700,
-    -0.550,
-    -0.400,
-    -0.200,
-    0.000,
-    0.200,
-    0.400,
-    0.550,
-    0.700,
-    0.850,
-    1.003,
-    1.140,
-    1.280,
-    1.440,
-    1.618,
+    -1.610, -1.444, -1.285, -1.145, -1.007, -0.850, -0.700, -0.550, -0.400,
+    -0.200, 0.000, 0.200, 0.400, 0.550, 0.700, 0.850, 1.003, 1.140, 1.280,
+    1.440, 1.618,
 ]
 
 
@@ -158,6 +140,22 @@ def get_total_offset_for_profil(
         return base_offset
     sec_idx = int((p - min_p) // sec_size)
     return base_offset + sec_offsets.get(sec_idx, 0.0)
+
+
+def get_closest_lcms_profile(lcms_profiles, target_p, max_tol=15.0):
+    """Bezpieczne wyszukiwanie najbliższego profilu LCMS, zapobiegające znikaniu wykresów."""
+    if not lcms_profiles:
+        return None, None
+    if target_p in lcms_profiles:
+        return target_p, lcms_profiles[target_p]
+
+    keys = np.array(list(lcms_profiles.keys()))
+    diffs = np.abs(keys - target_p)
+    min_idx = np.argmin(diffs)
+    if diffs[min_idx] <= max_tol:
+        closest_key = keys[min_idx]
+        return closest_key, lcms_profiles[closest_key]
+    return None, None
 
 
 # ==========================================
@@ -489,11 +487,23 @@ def load_multiple_lcms_files(uploaded_files_list):
         return {}
 
     profiles = {}
+    current_offset = 0
+    last_st = None
+
     for idx, r in enumerate(all_records):
         st_m = r["Station_m"]
-        pid = int(round(st_m)) if st_m is not None else idx + 1
 
-        while pid in profiles and r["Station_m"] is None:
+        if st_m is not None:
+            # Jeśli pikietaż w kolejnym pliku zeruje się (np. znów 1m po 500m), dodajemy offset
+            if last_st is not None and st_m < last_st - 50:
+                current_offset += int(round(last_st))
+            pid = int(round(st_m + current_offset))
+            last_st = st_m
+        else:
+            pid = idx + 1
+
+        # Gwarancja braku nadpisywania kluczy
+        while pid in profiles:
             pid += 1
 
         profiles[pid] = {
@@ -501,7 +511,7 @@ def load_multiple_lcms_files(uploaded_files_list):
             "z": r["z"],
             "rut_l": r["rut_l"],
             "rut_r": r["rut_r"],
-            "Station_m": st_m,
+            "Station_m": st_m if st_m is not None else pid,
         }
 
     return profiles
@@ -1218,11 +1228,15 @@ if bytes_rsp is not None:
         max_koleina_rsp = max(koleina_lewa_mm, koleina_prawa_mm)
 
         kol_lcms_l, kol_lcms_p, prof_lcms_data = None, None, None
-        if lcms_profiles and wybrany_profil_lcms in lcms_profiles:
-            prof_lcms_data = lcms_profiles[wybrany_profil_lcms]
-            kol_lcms_l, kol_lcms_p = prof_lcms_data.get(
-                "rut_l", None
-            ), prof_lcms_data.get("rut_r", None)
+        actual_lcms_pid = None
+        if lcms_profiles:
+            actual_lcms_pid, prof_lcms_data = get_closest_lcms_profile(
+                lcms_profiles, wybrany_profil_lcms
+            )
+            if prof_lcms_data is not None:
+                kol_lcms_l, kol_lcms_p = prof_lcms_data.get(
+                    "rut_l", None
+                ), prof_lcms_data.get("rut_r", None)
 
         calc_lcms_rut_l, calc_lcms_rut_r = 0.0, 0.0
 
@@ -1320,8 +1334,9 @@ if bytes_rsp is not None:
         with tab_main:
             st.subheader(
                 f"Profil RSP nr {wybrany_profil} (Dopasowany LCMS nr"
-                f" {wybrany_profil_lcms}, Offset Podłużny: {całkowity_offset:+.1f}"
-                f" m, Poprzeczny X: {manual_x_shift_lcms:+.2f} m)"
+                f" {actual_lcms_pid or wybrany_profil_lcms}, Offset Podłużny:"
+                f" {całkowity_offset:+.1f} m, Poprzeczny X:"
+                f" {manual_x_shift_lcms:+.2f} m)"
             )
 
             rc1, rc2, rc3 = st.columns(3)
@@ -1487,7 +1502,9 @@ if bytes_rsp is not None:
                         x=x_lcms,
                         y=z_lcms_plot,
                         mode="lines",
-                        name=f"Profil LCMS nr {wybrany_profil_lcms}",
+                        name=(
+                            f"Profil LCMS nr {actual_lcms_pid or wybrany_profil_lcms}"
+                        ),
                         line=dict(color="seagreen", width=2),
                     )
                 )
@@ -1612,8 +1629,10 @@ if bytes_rsp is not None:
                         min_p,
                     )
                     target_lcms_p = int(round(p_rsp + off_p))
-                    if target_lcms_p in lcms_profiles:
-                        p_data = lcms_profiles[target_lcms_p]
+                    _, p_data = get_closest_lcms_profile(
+                        lcms_profiles, target_lcms_p
+                    )
+                    if p_data is not None:
                         lcms_aligned_max.append(
                             max(p_data["rut_l"], p_data["rut_r"])
                         )
@@ -1718,13 +1737,12 @@ if bytes_rsp is not None:
                         min_p,
                     )
                     target_lcms_p = int(round(p_rsp + off_p))
-                    if target_lcms_p in lcms_profiles:
-                        lcms_l_vals.append(
-                            lcms_profiles[target_lcms_p]["rut_l"]
-                        )
-                        lcms_r_vals.append(
-                            lcms_profiles[target_lcms_p]["rut_r"]
-                        )
+                    _, p_data = get_closest_lcms_profile(
+                        lcms_profiles, target_lcms_p
+                    )
+                    if p_data is not None:
+                        lcms_l_vals.append(p_data["rut_l"])
+                        lcms_r_vals.append(p_data["rut_r"])
                     else:
                         lcms_l_vals.append(np.nan)
                         lcms_r_vals.append(np.nan)
