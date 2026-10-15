@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 # ==========================================
-# DOKŁADNA GEOMETRIA LASERÓW RSP [m]
+# DOKŁADNA GEOMETRIA LASERÓW RSP [m] (-1.610m do +1.618m)
 # ==========================================
 DEFAULT_RSP_X_STR = (
     "-1.610, -1.444, -1.285, -1.145, -1.007, -0.850, -0.700, -0.550, -0.400, "
@@ -15,9 +15,33 @@ DEFAULT_RSP_X_STR = (
     "1.440, 1.618"
 )
 
+DEFAULT_RSP_X_LIST = [
+    -1.610,
+    -1.444,
+    -1.285,
+    -1.145,
+    -1.007,
+    -0.850,
+    -0.700,
+    -0.550,
+    -0.400,
+    -0.200,
+    0.000,
+    0.200,
+    0.400,
+    0.550,
+    0.700,
+    0.850,
+    1.003,
+    1.140,
+    1.280,
+    1.440,
+    1.618,
+]
+
 
 # ==========================================
-# 1. PARSERY SUROWYCH PLIKÓW (.RSP, .GPX, .XML)
+# 1. PARSERY SUROWYCH PLIKÓW (.RSP, .GPX, .CSV, .XLSX)
 # ==========================================
 def parse_native_rsp_file(file_bytes):
     """Parsuje surowy plik Dynatest .rsp / .txt (linie 5201-5221, 5401, 5280)."""
@@ -221,28 +245,37 @@ def parse_rsp_gps_cached(file_bytes, file_name):
 
 
 @st.cache_data
-def parse_lcms_excel_cached(file_bytes, file_name):
-    """Parser pliku LCMS z pobraniem surowych danych kolein oraz profilu."""
+def parse_lcms_raw_cached(file_bytes, file_name):
+    """Parser surowych plików LCMS DSN (.csv oraz .xlsx)."""
     if file_name.lower().endswith(".csv"):
-        df_lcms_raw = pd.read_csv(
-            io.BytesIO(file_bytes), header=None, sep=None, engine="python"
-        )
+        try:
+            df_lcms_raw = pd.read_csv(
+                io.BytesIO(file_bytes), header=None, sep=";", engine="python"
+            )
+        except Exception:
+            df_lcms_raw = pd.read_csv(
+                io.BytesIO(file_bytes), header=None, sep=None, engine="python"
+            )
     else:
         df_lcms_raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
 
     profiles = {}
     num_rows = len(df_lcms_raw)
 
+    def is_valid_profile_id(val):
+        s = str(val).strip().replace(".0", "")
+        return s.isdigit() and len(s) > 0
+
     data_rows = []
     for idx in range(num_rows):
-        val_a = str(df_lcms_raw.iloc[idx, 0]).strip()
+        val_a = df_lcms_raw.iloc[idx, 0]
         val_b = (
             str(df_lcms_raw.iloc[idx, 1])
             .replace(",", ".")
             .replace("-", "")
             .strip()
         )
-        if val_a.isdigit():
+        if is_valid_profile_id(val_a):
             try:
                 float(val_b)
                 data_rows.append(idx)
@@ -260,8 +293,9 @@ def parse_lcms_excel_cached(file_bytes, file_name):
             break
 
         try:
-            rut_l_str = str(df_lcms_raw.iloc[r_left_h, 1]).replace(",", ".")
-            rut_r_str = str(df_lcms_raw.iloc[r_left_h, 2]).replace(",", ".")
+            rut_l_str = str(df_lcms_raw.iloc[r_left_h, 1]).replace(",", ".").strip()
+            rut_r_str = str(df_lcms_raw.iloc[r_left_h, 2]).replace(",", ".").strip()
+
             rut_l = (
                 float(rut_l_str)
                 if rut_l_str.replace(".", "", 1).replace("-", "").isdigit()
@@ -439,6 +473,48 @@ def compute_all_rsp_ruts_cached(df_rsp, x_vals_tuple):
     })
 
 
+@st.cache_data
+def compute_all_lcms_calc_ruts_cached(lcms_profiles):
+    """Wylicza koleiny z Wirtualnej Łaty dla wszystkich profili LCMS."""
+    ruts_calc_l, ruts_calc_r = [], []
+    prof_list = sorted(lcms_profiles.keys())
+
+    for pid in prof_list:
+        pdata = lcms_profiles[pid]
+        x_pts, z_pts = pdata["x"], pdata["z"]
+        if len(x_pts) < 10:
+            ruts_calc_l.append(0.0)
+            ruts_calc_r.append(0.0)
+            continue
+
+        z_smooth = smooth_profile(z_pts, window_size=31)
+        mid_mask = (x_pts >= -0.5) & (x_pts <= 0.5)
+        if np.any(mid_mask):
+            idx_crown = np.where(mid_mask)[0][np.argmax(z_smooth[mid_mask])]
+        else:
+            idx_crown = np.argmin(np.abs(x_pts))
+
+        x_l, z_l = x_pts[: idx_crown + 1], z_smooth[: idx_crown + 1]
+        x_r, z_r = x_pts[idx_crown:], z_smooth[idx_crown:]
+
+        lata_l = get_upper_hull(x_l, z_l)
+        lata_r = get_upper_hull(x_r, z_r)
+
+        ruts_calc_l.append(
+            float(np.max(lata_l - z_l)) if len(z_l) > 0 else 0.0
+        )
+        ruts_calc_r.append(
+            float(np.max(lata_r - z_r)) if len(z_r) > 0 else 0.0
+        )
+
+    return pd.DataFrame({
+        "Profil": prof_list,
+        "LCMS_Calc_Rut_L": ruts_calc_l,
+        "LCMS_Calc_Rut_R": ruts_calc_r,
+        "LCMS_Calc_Rut_Max": np.maximum(ruts_calc_l, ruts_calc_r),
+    })
+
+
 def auto_align_offset_clean(rsp_s, lcms_s, max_search=100):
     """Automatycznie dopasowuje pikietaż na podstawie korelacji wykresu kolein."""
     r = np.array(rsp_s) - np.mean(rsp_s)
@@ -516,9 +592,9 @@ uploaded_rsp_gps = st.sidebar.file_uploader(
     key="rsp_gps_input",
 )
 
-st.sidebar.header("2. Dane LCMS (Opcjonalnie)")
+st.sidebar.header("2. Dane LCMS (Surowe CSV / Excel)")
 uploaded_lcms = st.sidebar.file_uploader(
-    "Wgraj plik LCMS (.xlsx / .csv)", type=["xlsx", "csv"], key="lcms_input"
+    "Wgraj plik LCMS (.csv / .xlsx)", type=["csv", "xlsx"], key="lcms_input"
 )
 uploaded_xml = st.sidebar.file_uploader(
     "Wgraj plik XML z LCMS (GPS)", type=["xml"], key="xml_input"
@@ -546,7 +622,7 @@ bytes_rsp_gps, name_rsp_gps = get_file_bytes_and_name(
     ],
 )
 bytes_lcms, name_lcms = get_file_bytes_and_name(
-    uploaded_lcms, ["data/lcms.xlsx", "data/lcms.csv", "lcms.xlsx", "lcms.csv"]
+    uploaded_lcms, ["data/lcms.csv", "data/lcms.xlsx", "lcms.csv", "lcms.xlsx"]
 )
 bytes_xml, name_xml = get_file_bytes_and_name(
     uploaded_xml, ["data/lcms.xml", "lcms.xml"]
@@ -606,29 +682,7 @@ if typ_geometrii == "Wprowadzona w pliku / Domyślna RSP":
             if val.strip() != ""
         ]
     except Exception:
-        pozycja_x = auto_x_from_rsp or [
-            -1.610,
-            -1.444,
-            -1.285,
-            -1.145,
-            -1.007,
-            -0.850,
-            -0.700,
-            -0.550,
-            -0.400,
-            -0.200,
-            0.000,
-            0.200,
-            0.400,
-            0.550,
-            0.700,
-            0.850,
-            1.003,
-            1.140,
-            1.280,
-            1.440,
-            1.618,
-        ]
+        pozycja_x = auto_x_from_rsp or DEFAULT_RSP_X_LIST
 else:
     krok_laserow = st.sidebar.number_input(
         "Odstęp [m]:",
@@ -642,7 +696,7 @@ else:
 
 st.sidebar.header("5. Wybór Źródła Kolein LCMS")
 zrodlo_lcms = st.sidebar.radio(
-    "Wykresy podłużne LCMS bazują na:",
+    "Wykresy podłużne i kafelki LCMS bazują na:",
     [
         "Z pliku LCMS (surowe B2/C2)",
         "Wyliczone z profilu (Wirtualna Łata)",
@@ -690,7 +744,7 @@ if bytes_rsp_gps is not None:
 lcms_profiles = None
 if bytes_lcms is not None:
     try:
-        lcms_profiles = parse_lcms_excel_cached(bytes_lcms, name_lcms)
+        lcms_profiles = parse_lcms_raw_cached(bytes_lcms, name_lcms)
         st.sidebar.success(f"LCMS: {len(lcms_profiles)} profili.")
     except Exception as e:
         st.sidebar.error(f"Błąd LCMS: {e}")
@@ -761,7 +815,7 @@ if bytes_rsp is not None:
             )
             st.session_state["offset_pikitaz_input"] = float(sug_offset)
             st.sidebar.success(
-                f"✅ Wyrysowano optymalne przesunięcie pikietażu: {sug_offset:+} m"
+                f"✅ Optymalne przesunięcie pikietażu wynosi: {sug_offset:+} m"
             )
             st.rerun()
 
@@ -844,39 +898,76 @@ if bytes_rsp is not None:
             f" przesunięcie: {całkowity_offset:+.1f} m)"
         )
 
-        # KAFELKI INFORMACYJNE (RSP U GÓRY, LCMS POD SPODEM)
+        # KAFELKI INFORMACYJNE
         st.markdown("##### 🟦 Dane z Profilografu RSP")
         rc1, rc2, rc3 = st.columns(3)
         rc1.metric(
             "RSP Koleina Lewa",
             f"{koleina_lewa_mm:.1f} mm",
-            f"Laser L{idx_kol_l+1} ({x_vals[idx_kol_l]}m)",
+            f"Laser L{idx_kol_l+1} ({x_vals[idx_kol_l]:.2f}m)",
         )
         rc2.metric(
             "RSP Koleina Prawa",
             f"{koleina_prawa_mm:.1f} mm",
-            f"Laser L{idx_kol_p+1} ({x_vals[idx_kol_p]}m)",
+            f"Laser L{idx_kol_p+1} ({x_vals[idx_kol_p]:.2f}m)",
         )
         rc3.metric("RSP Koleina Maksymalna", f"{max_koleina_rsp:.1f} mm")
+
+        # Obliczenia Wirtualnej Łaty dla LCMS
+        calc_lcms_rut_l, calc_lcms_rut_r = None, None
+        if prof_lcms_data is not None:
+            x_lcms_orig = prof_lcms_data["x"].copy()
+            z_lcms_raw = prof_lcms_data["z"]
+            z_lcms_smooth = smooth_profile(z_lcms_raw, window_size=31)
+
+            mid_mask_raw = (x_lcms_orig >= -0.5) & (x_lcms_orig <= 0.5)
+            if np.any(mid_mask_raw):
+                idx_c_lcms = np.where(mid_mask_raw)[0][
+                    np.argmax(z_lcms_smooth[mid_mask_raw])
+                ]
+            else:
+                idx_c_lcms = np.argmin(np.abs(x_lcms_orig))
+
+            x_lcms_l_raw = x_lcms_orig[: idx_c_lcms + 1]
+            z_lcms_l_raw = z_lcms_smooth[: idx_c_lcms + 1]
+            x_lcms_r_raw = x_lcms_orig[idx_c_lcms:]
+            z_lcms_r_raw = z_lcms_smooth[idx_c_lcms:]
+
+            lata_raw_l = get_upper_hull(x_lcms_l_raw, z_lcms_l_raw)
+            lata_raw_r = get_upper_hull(x_lcms_r_raw, z_lcms_r_raw)
+
+            calc_lcms_rut_l = float(np.max(lata_raw_l - z_lcms_l_raw))
+            calc_lcms_rut_r = float(np.max(lata_raw_r - z_lcms_r_raw))
 
         st.markdown("##### 🟩 Dane z Systemu LCMS")
         lc1, lc2, lc3 = st.columns(3)
         if kol_lcms_l is not None and kol_lcms_p is not None:
-            max_koleina_lcms = max(kol_lcms_l, kol_lcms_p)
+            # Reaktywny wybór wartości w zależności od opcji 5
+            if zrodlo_lcms == "Z pliku LCMS (surowe B2/C2)":
+                disp_l, disp_p = kol_lcms_l, kol_lcms_p
+                label_sub = "(z pliku B2/C2)"
+            elif zrodlo_lcms == "Wyliczone z profilu (Wirtualna Łata)":
+                disp_l, disp_p = calc_lcms_rut_l, calc_lcms_rut_r
+                label_sub = "(z Łaty DSN)"
+            else:
+                disp_l, disp_p = kol_lcms_l, kol_lcms_p
+                label_sub = f"(Plik: {kol_lcms_l:.1f} / Łata: {calc_lcms_rut_l:.1f})"
+
+            max_disp = max(disp_l, disp_p)
             lc1.metric(
-                "LCMS Koleina Lewa (z pliku)",
-                f"{kol_lcms_l:.1f} mm",
-                delta=f"{koleina_lewa_mm - kol_lcms_l:+.1f} mm vs RSP",
+                f"LCMS Koleina Lewa {label_sub}",
+                f"{disp_l:.1f} mm",
+                delta=f"{koleina_lewa_mm - disp_l:+.1f} mm vs RSP",
             )
             lc2.metric(
-                "LCMS Koleina Prawa (z pliku)",
-                f"{kol_lcms_p:.1f} mm",
-                delta=f"{koleina_prawa_mm - kol_lcms_p:+.1f} mm vs RSP",
+                f"LCMS Koleina Prawa {label_sub}",
+                f"{disp_p:.1f} mm",
+                delta=f"{koleina_prawa_mm - disp_p:+.1f} mm vs RSP",
             )
             lc3.metric(
                 "LCMS Koleina Maksymalna",
-                f"{max_koleina_lcms:.1f} mm",
-                delta=f"{max_koleina_rsp - max_koleina_lcms:+.1f} mm vs RSP",
+                f"{max_disp:.1f} mm",
+                delta=f"{max_koleina_rsp - max_disp:+.1f} mm vs RSP",
             )
         else:
             lc1.info("Brak profilu LCMS dla wybranego pikietażu.")
@@ -919,7 +1010,6 @@ if bytes_rsp is not None:
                 )
             )
 
-            # Etykieta RSP LEWA
             x_kl, y_kl_prof, y_kl_lata = (
                 x_vals[idx_kol_l],
                 y_vals[idx_kol_l],
@@ -947,7 +1037,6 @@ if bytes_rsp is not None:
                 xanchor="right",
             )
 
-            # Etykieta RSP PRAWA
             x_kp, y_kp_prof, y_kp_lata = (
                 x_vals[idx_kol_p],
                 y_vals[idx_kol_p],
@@ -975,31 +1064,30 @@ if bytes_rsp is not None:
                 xanchor="right",
             )
 
-        # Obróbka i Łata LCMS
+        # Obróbka i Łata LCMS z precyzyjną geometrią X
         if prof_lcms_data is not None:
             x_lcms_orig = prof_lcms_data["x"].copy()
             z_lcms_raw = prof_lcms_data["z"]
             z_lcms_smooth = smooth_profile(z_lcms_raw, window_size=31)
 
-            # Przekształcenia Geometrii Poprzecznej LCMS vs RSP
-            x_lcms = x_lcms_orig.copy()
             rsp_x_max = np.max(x_vals)
             rsp_x_min = np.min(x_vals)
 
-            if skaluj_szerokosc and len(x_lcms) > 1:
-                rsp_w = rsp_x_max - rsp_x_min
-                lcms_w = np.max(x_lcms) - np.min(x_lcms)
-                x_lcms = rsp_x_min + (x_lcms - np.min(x_lcms)) * (
-                    rsp_w / lcms_w
-                )
+            x_lcms = x_lcms_orig.copy()
 
-            if zaczep_prawa_krawedz and len(x_lcms) > 0:
+            # Precyzyjne dopasowanie geometrii krawędzi
+            if skaluj_szerokosc and len(x_lcms) > 1:
+                lcms_min = np.min(x_lcms)
+                lcms_max = np.max(x_lcms)
+                x_lcms = rsp_x_min + (x_lcms - lcms_min) * (
+                    (rsp_x_max - rsp_x_min) / (lcms_max - lcms_min)
+                )
+            elif zaczep_prawa_krawedz and len(x_lcms) > 0:
                 shift_right = rsp_x_max - np.max(x_lcms)
                 x_lcms = x_lcms + shift_right
 
             x_lcms = x_lcms + manual_x_shift_lcms
 
-            # Obliczanie łaty PRZED obracaniem profilu
             mid_mask_raw = (x_lcms >= -0.5) & (x_lcms <= 0.5)
             if np.any(mid_mask_raw):
                 idx_crown_lcms = np.where(mid_mask_raw)[0][
@@ -1015,9 +1103,6 @@ if bytes_rsp is not None:
 
             lata_raw_l = get_upper_hull(x_lcms_l, z_lcms_l_raw)
             lata_raw_r = get_upper_hull(x_lcms_r, z_lcms_r_raw)
-
-            calc_lcms_rut_l = float(np.max(lata_raw_l - z_lcms_l_raw))
-            calc_lcms_rut_r = float(np.max(lata_raw_r - z_lcms_r_raw))
 
             if wyrownaj_spadek_lcms and len(x_lcms) > 10:
                 p_trend = np.polyfit(x_lcms, z_lcms_smooth, 1)
@@ -1067,6 +1152,20 @@ if bytes_rsp is not None:
                     )
                 )
 
+                # Wartość do wyświetlenia w etykietach LCMS w zależności od opcji 5
+                val_l_show = (
+                    kol_lcms_l
+                    if zrodlo_lcms == "Z pliku LCMS (surowe B2/C2)"
+                    and kol_lcms_l is not None
+                    else calc_lcms_rut_l
+                )
+                val_r_show = (
+                    kol_lcms_p
+                    if zrodlo_lcms == "Z pliku LCMS (surowe B2/C2)"
+                    and kol_lcms_p is not None
+                    else calc_lcms_rut_r
+                )
+
                 # Etykieta LCMS LEWA
                 diff_lcms_l = lata_plot_l_zero - (
                     z_lcms_plot[: idx_crown_lcms + 1]
@@ -1081,7 +1180,7 @@ if bytes_rsp is not None:
                         x=[x_kl_c, x_kl_c],
                         y=[y_kl_c_lata, y_kl_c_prof],
                         mode="lines+markers",
-                        name=f"Głębokość LCMS Lewa ({calc_lcms_rut_l:.1f} mm)",
+                        name=f"Głębokość LCMS Lewa ({val_l_show:.1f} mm)",
                         line=dict(color="forestgreen", width=2.5),
                         marker=dict(size=5, symbol="triangle-down"),
                     )
@@ -1089,7 +1188,7 @@ if bytes_rsp is not None:
                 fig.add_annotation(
                     x=x_kl_c,
                     y=(y_kl_c_lata + y_kl_c_prof) / 2,
-                    text=f"<b>LCMS: {calc_lcms_rut_l:.1f} mm</b> ",
+                    text=f"<b>LCMS: {val_l_show:.1f} mm</b> ",
                     showarrow=False,
                     font=dict(color="forestgreen", size=12),
                     bgcolor="rgba(235, 255, 235, 0.95)",
@@ -1111,7 +1210,7 @@ if bytes_rsp is not None:
                         x=[x_kp_c, x_kp_c],
                         y=[y_kp_c_lata, y_kp_c_prof],
                         mode="lines+markers",
-                        name=f"Głębokość LCMS Prawa ({calc_lcms_rut_r:.1f} mm)",
+                        name=f"Głębokość LCMS Prawa ({val_r_show:.1f} mm)",
                         line=dict(color="forestgreen", width=2.5),
                         marker=dict(size=5, symbol="triangle-down"),
                     )
@@ -1119,7 +1218,7 @@ if bytes_rsp is not None:
                 fig.add_annotation(
                     x=x_kp_c,
                     y=(y_kp_c_lata + y_kp_c_prof) / 2,
-                    text=f"<b>LCMS: {calc_lcms_rut_r:.1f} mm</b> ",
+                    text=f"<b>LCMS: {val_r_show:.1f} mm</b> ",
                     showarrow=False,
                     font=dict(color="forestgreen", size=12),
                     bgcolor="rgba(235, 255, 235, 0.95)",
@@ -1157,11 +1256,17 @@ if bytes_rsp is not None:
         has_lcms = lcms_profiles is not None and len(lcms_profiles) > 0
         if has_lcms:
             list_lcms_p = sorted(lcms_profiles.keys())
+            df_lcms_calc_all = compute_all_lcms_calc_ruts_cached(lcms_profiles)
+
             lcms_file_rut_l = [lcms_profiles[p]["rut_l"] for p in list_lcms_p]
             lcms_file_rut_r = [lcms_profiles[p]["rut_r"] for p in list_lcms_p]
             lcms_file_rut_max = np.maximum(lcms_file_rut_l, lcms_file_rut_r)
 
-            # Uwzględnienie przesunięć sekcyjnych
+            lcms_calc_rut_l = df_lcms_calc_all["LCMS_Calc_Rut_L"].values
+            lcms_calc_rut_r = df_lcms_calc_all["LCMS_Calc_Rut_R"].values
+            lcms_calc_rut_max = df_lcms_calc_all["LCMS_Calc_Rut_Max"].values
+
+            # Przesunięcia sekcyjne pikietażu
             lcms_p_shifted = []
             for p in list_lcms_p:
                 if podziel_na_sekcje:
@@ -1189,19 +1294,36 @@ if bytes_rsp is not None:
                     line=dict(color="royalblue", width=2),
                 )
             )
-            if has_lcms and zrodlo_lcms in [
-                "Z pliku LCMS (surowe B2/C2)",
-                "Oba źródła jednocześnie",
-            ]:
-                fig_l.add_trace(
-                    go.Scatter(
-                        x=lcms_p_shifted,
-                        y=lcms_file_rut_l,
-                        mode="lines",
-                        name="LCMS Lewa (Z pliku B2)",
-                        line=dict(color="forestgreen", width=2),
+            if has_lcms:
+                if zrodlo_lcms in [
+                    "Z pliku LCMS (surowe B2/C2)",
+                    "Oba źródła jednocześnie",
+                ]:
+                    fig_l.add_trace(
+                        go.Scatter(
+                            x=lcms_p_shifted,
+                            y=lcms_file_rut_l,
+                            mode="lines",
+                            name="LCMS Lewa (Z pliku B2)",
+                            line=dict(color="forestgreen", width=2),
+                        )
                     )
-                )
+                if zrodlo_lcms in [
+                    "Wyliczone z profilu (Wirtualna Łata)",
+                    "Oba źródła jednocześnie",
+                ]:
+                    fig_l.add_trace(
+                        go.Scatter(
+                            x=lcms_p_shifted,
+                            y=lcms_calc_rut_l,
+                            mode="lines",
+                            name="LCMS Lewa (Wirtualna Łata)",
+                            line=dict(
+                                color="limegreen", width=1.5, dash="dash"
+                            ),
+                        )
+                    )
+
             fig_l.add_vline(
                 x=wybrany_profil,
                 line_width=2,
@@ -1228,19 +1350,36 @@ if bytes_rsp is not None:
                     line=dict(color="darkorange", width=2),
                 )
             )
-            if has_lcms and zrodlo_lcms in [
-                "Z pliku LCMS (surowe B2/C2)",
-                "Oba źródła jednocześnie",
-            ]:
-                fig_r.add_trace(
-                    go.Scatter(
-                        x=lcms_p_shifted,
-                        y=lcms_file_rut_r,
-                        mode="lines",
-                        name="LCMS Prawa (Z pliku C2)",
-                        line=dict(color="limegreen", width=2),
+            if has_lcms:
+                if zrodlo_lcms in [
+                    "Z pliku LCMS (surowe B2/C2)",
+                    "Oba źródła jednocześnie",
+                ]:
+                    fig_r.add_trace(
+                        go.Scatter(
+                            x=lcms_p_shifted,
+                            y=lcms_file_rut_r,
+                            mode="lines",
+                            name="LCMS Prawa (Z pliku C2)",
+                            line=dict(color="forestgreen", width=2),
+                        )
                     )
-                )
+                if zrodlo_lcms in [
+                    "Wyliczone z profilu (Wirtualna Łata)",
+                    "Oba źródła jednocześnie",
+                ]:
+                    fig_r.add_trace(
+                        go.Scatter(
+                            x=lcms_p_shifted,
+                            y=lcms_calc_rut_r,
+                            mode="lines",
+                            name="LCMS Prawa (Wirtualna Łata)",
+                            line=dict(
+                                color="limegreen", width=1.5, dash="dash"
+                            ),
+                        )
+                    )
+
             fig_r.add_vline(
                 x=wybrany_profil,
                 line_width=2,
@@ -1267,19 +1406,36 @@ if bytes_rsp is not None:
                     line=dict(color="crimson", width=2.5),
                 )
             )
-            if has_lcms and zrodlo_lcms in [
-                "Z pliku LCMS (surowe B2/C2)",
-                "Oba źródła jednocześnie",
-            ]:
-                fig_m.add_trace(
-                    go.Scatter(
-                        x=lcms_p_shifted,
-                        y=lcms_file_rut_max,
-                        mode="lines",
-                        name="LCMS Koleina Max (Z pliku B2/C2)",
-                        line=dict(color="forestgreen", width=2.5),
+            if has_lcms:
+                if zrodlo_lcms in [
+                    "Z pliku LCMS (surowe B2/C2)",
+                    "Oba źródła jednocześnie",
+                ]:
+                    fig_m.add_trace(
+                        go.Scatter(
+                            x=lcms_p_shifted,
+                            y=lcms_file_rut_max,
+                            mode="lines",
+                            name="LCMS Koleina Max (Z pliku B2/C2)",
+                            line=dict(color="forestgreen", width=2.5),
+                        )
                     )
-                )
+                if zrodlo_lcms in [
+                    "Wyliczone z profilu (Wirtualna Łata)",
+                    "Oba źródła jednocześnie",
+                ]:
+                    fig_m.add_trace(
+                        go.Scatter(
+                            x=lcms_p_shifted,
+                            y=lcms_calc_rut_max,
+                            mode="lines",
+                            name="LCMS Koleina Max (Wirtualna Łata)",
+                            line=dict(
+                                color="limegreen", width=1.5, dash="dash"
+                            ),
+                        )
+                    )
+
             fig_m.add_vline(
                 x=wybrany_profil,
                 line_width=2,
@@ -1317,24 +1473,54 @@ if bytes_rsp is not None:
             )
 
             if has_lcms:
-                fig_all.add_trace(
-                    go.Scatter(
-                        x=lcms_p_shifted,
-                        y=lcms_file_rut_l,
-                        mode="lines",
-                        name="LCMS Lewa (Plik B2)",
-                        line=dict(color="forestgreen", width=1.5),
+                if zrodlo_lcms in [
+                    "Z pliku LCMS (surowe B2/C2)",
+                    "Oba źródła jednocześnie",
+                ]:
+                    fig_all.add_trace(
+                        go.Scatter(
+                            x=lcms_p_shifted,
+                            y=lcms_file_rut_l,
+                            mode="lines",
+                            name="LCMS Lewa (Plik B2)",
+                            line=dict(color="forestgreen", width=1.5),
+                        )
                     )
-                )
-                fig_all.add_trace(
-                    go.Scatter(
-                        x=lcms_p_shifted,
-                        y=lcms_file_rut_r,
-                        mode="lines",
-                        name="LCMS Prawa (Plik C2)",
-                        line=dict(color="limegreen", width=1.5),
+                    fig_all.add_trace(
+                        go.Scatter(
+                            x=lcms_p_shifted,
+                            y=lcms_file_rut_r,
+                            mode="lines",
+                            name="LCMS Prawa (Plik C2)",
+                            line=dict(color="limegreen", width=1.5),
+                        )
                     )
-                )
+                if zrodlo_lcms in [
+                    "Wyliczone z profilu (Wirtualna Łata)",
+                    "Oba źródła jednocześnie",
+                ]:
+                    fig_all.add_trace(
+                        go.Scatter(
+                            x=lcms_p_shifted,
+                            y=lcms_calc_rut_l,
+                            mode="lines",
+                            name="LCMS Lewa (Łata)",
+                            line=dict(
+                                color="forestgreen", width=1.0, dash="dash"
+                            ),
+                        )
+                    )
+                    fig_all.add_trace(
+                        go.Scatter(
+                            x=lcms_p_shifted,
+                            y=lcms_calc_rut_r,
+                            mode="lines",
+                            name="LCMS Prawa (Łata)",
+                            line=dict(
+                                color="limegreen", width=1.0, dash="dash"
+                            ),
+                        )
+                    )
 
             fig_all.add_vline(
                 x=wybrany_profil,
