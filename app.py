@@ -264,7 +264,6 @@ def parse_lcms_raw_cached(file_bytes, file_name):
         df_excel = pd.read_excel(io.BytesIO(file_bytes), header=None)
         raw_rows = [[str(v).replace(",", ".").strip() if pd.notna(v) else "" for v in r] for r in df_excel.values]
     else:
-        # Dekodowanie ze strumienia dla ogromnych plików CSV/.2025
         text_stream = io.StringIO(file_bytes.decode("utf-8", errors="ignore"))
         first_line = text_stream.readline()
         text_stream.seek(0)
@@ -1089,6 +1088,17 @@ if bytes_rsp is not None:
     df_rsp = load_rsp_data(bytes_rsp, name_rsp)
 
     col_profil = "Profil" if "Profil" in df_rsp.columns else df_rsp.columns[0]
+
+    # CZYSZCZENIE I BEZPIECZNA KONWERSJA NUMERYCZNA NUMERU PROFILU
+    df_rsp[col_profil] = pd.to_numeric(
+        df_rsp[col_profil].astype(str).str.replace(",", "."), errors="coerce"
+    )
+    df_rsp = df_rsp.dropna(subset=[col_profil])
+
+    if df_rsp.empty:
+        st.error("❌ Wczytany plik RSP nie zawiera prawidłowych numerów profili.")
+        st.stop()
+
     min_p = int(df_rsp[col_profil].min())
     max_p = int(df_rsp[col_profil].max())
 
