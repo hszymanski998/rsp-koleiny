@@ -1,5 +1,6 @@
 import io
 import os
+import csv
 import xml.etree.ElementTree as ET
 import numpy as np
 import pandas as pd
@@ -50,7 +51,7 @@ def get_dsn_color(klasa):
 
 
 # ==========================================
-# 2. PARSERY SUROWYCH PLIKÓW (.RSP, .GPX, .CSV, .XLSX)
+# 2. PARSERY ZOPTYMALIZOWANE (SUROWE PLIKI, .2025, GPX, CSV, XLSX)
 # ==========================================
 def parse_native_rsp_file(file_bytes):
     """Parsuje surowy plik Dynatest .rsp / .txt (linie 5201-5221, 5401, 5280)."""
@@ -134,7 +135,8 @@ def parse_gpx_cached(file_bytes):
                     name = pt.findtext("name")
                     clean_km = (
                         float(name)
-                        if name and name.replace(".", "", 1).replace("-", "").isdigit()
+                        if name
+                        and name.replace(".", "", 1).replace("-", "").isdigit()
                         else len(records) + 1
                     )
                     records.append({
@@ -179,14 +181,18 @@ def get_file_bytes_and_name(uploaded_file, default_paths):
 
 @st.cache_data
 def load_rsp_data(file_bytes, file_name):
-    """Wczytuje i keszuje dane RSP."""
-    if file_name.lower().endswith(".rsp") or file_name.lower().endswith(".txt"):
+    """Wczytuje i keszuje dane RSP, odporne na pliki .2025 i niestandardowe separatory."""
+    ext = file_name.lower().split('.')[-1]
+    if ext in ["rsp", "txt"]:
         df_prof, _, _ = parse_native_rsp_file(file_bytes)
         if df_prof is not None:
             return df_prof
 
-    if file_name.lower().endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python")
+    if ext in ["csv", "2025", "2026", "2024"]:
+        try:
+            df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python")
+        except pd.errors.ParserError:
+            df = pd.read_csv(io.BytesIO(file_bytes), sep=";")
     else:
         df = pd.read_excel(io.BytesIO(file_bytes))
     df.columns = df.columns.str.strip()
@@ -196,17 +202,18 @@ def load_rsp_data(file_bytes, file_name):
 @st.cache_data
 def parse_rsp_gps_cached(file_bytes, file_name):
     """Parser GPS z plików GPX / RSP / CSV / Excel."""
-    if file_name.lower().endswith(".gpx"):
+    ext = file_name.lower().split('.')[-1]
+    if ext == "gpx":
         df_gpx = parse_gpx_cached(file_bytes)
         if df_gpx is not None:
             return df_gpx
 
-    if file_name.lower().endswith(".rsp") or file_name.lower().endswith(".txt"):
+    if ext in ["rsp", "txt"]:
         _, df_gps, _ = parse_native_rsp_file(file_bytes)
         if df_gps is not None:
             return df_gps
 
-    if file_name.lower().endswith(".csv") or file_name.lower().endswith(".txt"):
+    if ext in ["csv", "2025", "2026", "2024", "txt"]:
         try:
             df = pd.read_csv(
                 io.BytesIO(file_bytes), header=None, sep=None, engine="python"
@@ -232,10 +239,8 @@ def parse_rsp_gps_cached(file_bytes, file_name):
             elif 13.0 <= m <= 25.0 and lon_col is None:
                 lon_col = col
 
-    if lat_col is None:
-        lat_col = 5
-    if lon_col is None:
-        lon_col = 6
+    if lat_col is None: lat_col = 5
+    if lon_col is None: lon_col = 6
 
     res = pd.DataFrame({
         "LAT": df_clean[lat_col],
@@ -251,24 +256,23 @@ def parse_rsp_gps_cached(file_bytes, file_name):
 
 @st.cache_data
 def parse_lcms_raw_cached(file_bytes, file_name):
-    """Pancerny parser plików LCMS z obsługą surowego CSV linia po linii."""
-    if file_name.lower().endswith(".xlsx") or file_name.lower().endswith(".xls"):
+    """Zoptymalizowany pancerny parser plików LCMS (obsługuje setki tysięcy wierszy z .2025 bez wysypywania RAM)."""
+    ext = file_name.lower().split('.')[-1]
+    raw_rows = []
+    
+    if ext in ["xlsx", "xls"]:
         df_excel = pd.read_excel(io.BytesIO(file_bytes), header=None)
-        raw_rows = []
-        for _, r in df_excel.iterrows():
-            raw_rows.append([
-                str(v).replace(",", ".").strip() if pd.notna(v) else ""
-                for v in r.values
-            ])
+        raw_rows = [[str(v).replace(",", ".").strip() if pd.notna(v) else "" for v in r] for r in df_excel.values]
     else:
-        text = file_bytes.decode("utf-8", errors="ignore")
-        lines = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
-        first_line = lines[0] if lines else ""
+        # Dekodowanie ze strumienia dla ogromnych plików CSV/.2025
+        text_stream = io.StringIO(file_bytes.decode("utf-8", errors="ignore"))
+        first_line = text_stream.readline()
+        text_stream.seek(0)
         sep = ";" if ";" in first_line else ("," if "," in first_line else "\t")
-        raw_rows = []
-        for line in lines:
-            parts = [p.strip().replace(",", ".") for p in line.split(sep)]
-            raw_rows.append(parts)
+        
+        reader = csv.reader(text_stream, delimiter=sep)
+        for row in reader:
+            raw_rows.append([p.strip().replace(",", ".") for p in row])
 
     data_row_indices = []
     for idx, row in enumerate(raw_rows):
@@ -303,7 +307,6 @@ def parse_lcms_raw_cached(file_bytes, file_name):
 
             x_left = [float(v) for v in row_lh[3:] if v != ""]
             z_left = [float(v) for v in row_ld[3:] if v != ""]
-
             x_right = [float(v) for v in row_rh[3:] if v != ""]
             z_right = [float(v) for v in row_rd[3:] if v != ""]
 
@@ -748,18 +751,18 @@ def compute_50m_dsn_sections_full(df_ruts, step_m=1.0, section_m=50.0):
         if "LCMS_Rut_L" in sub.columns:
             lcms_l = sub["LCMS_Rut_L"].values
             lcms_r = sub["LCMS_Rut_R"].values
-            lcms_max = np.maximum(lcms_l, lcms_r)
+            lcms_max = sub["LCMS_Rut_Max"].values
 
-            e_l_lcms = np.mean(lcms_l)
-            d_l_lcms = np.std(lcms_l, ddof=0)
+            e_l_lcms = np.nanmean(lcms_l) if not np.all(np.isnan(lcms_l)) else 0.0
+            d_l_lcms = np.nanstd(lcms_l, ddof=0) if not np.all(np.isnan(lcms_l)) else 0.0
             hm_l_lcms = int(np.round(e_l_lcms + 2 * d_l_lcms))
 
-            e_r_lcms = np.mean(lcms_r)
-            d_r_lcms = np.std(lcms_r, ddof=0)
+            e_r_lcms = np.nanmean(lcms_r) if not np.all(np.isnan(lcms_r)) else 0.0
+            d_r_lcms = np.nanstd(lcms_r, ddof=0) if not np.all(np.isnan(lcms_r)) else 0.0
             hm_r_lcms = int(np.round(e_r_lcms + 2 * d_r_lcms))
 
-            e_m_lcms = np.mean(lcms_max)
-            d_m_lcms = np.std(lcms_max, ddof=0)
+            e_m_lcms = np.nanmean(lcms_max) if not np.all(np.isnan(lcms_max)) else 0.0
+            d_m_lcms = np.nanstd(lcms_max, ddof=0) if not np.all(np.isnan(lcms_max)) else 0.0
             hm_m_lcms = int(np.round(e_m_lcms + 2 * d_m_lcms))
 
             rec.update({
@@ -874,19 +877,21 @@ if "offset_pikitaz_input" not in st.session_state:
 # ==========================================
 st.sidebar.header("1. Dane RSP (Profilograf / Surowe)")
 uploaded_rsp = st.sidebar.file_uploader(
-    "Wgraj plik RSP (.rsp / .xlsx / .csv / .txt)",
-    type=["rsp", "xlsx", "csv", "txt"],
+    "Wgraj plik RSP (.rsp / .2025 / .csv / .txt)",
+    type=["rsp", "2025", "2026", "2024", "xlsx", "csv", "txt"],
     key="rsp_input",
 )
 uploaded_rsp_gps = st.sidebar.file_uploader(
-    "Wgraj plik GPS RSP (.gpx / .rsp / .csv / .txt)",
-    type=["gpx", "rsp", "xlsx", "csv", "txt"],
+    "Wgraj plik GPS RSP (.gpx / .rsp / .2025 / .csv / .txt)",
+    type=["gpx", "rsp", "2025", "2026", "2024", "xlsx", "csv", "txt"],
     key="rsp_gps_input",
 )
 
-st.sidebar.header("2. Dane LCMS (Surowe CSV / Excel)")
+st.sidebar.header("2. Dane LCMS (Surowe CSV / Excel / .2025)")
 uploaded_lcms = st.sidebar.file_uploader(
-    "Wgraj plik LCMS (.csv / .xlsx)", type=["csv", "xlsx"], key="lcms_input"
+    "Wgraj plik LCMS (.csv / .2025 / .xlsx)", 
+    type=["csv", "2025", "2026", "2024", "xlsx"], 
+    key="lcms_input"
 )
 uploaded_xml = st.sidebar.file_uploader(
     "Wgraj plik XML z LCMS (GPS)", type=["xml"], key="xml_input"
@@ -976,7 +981,7 @@ sekcje_offsets = {}
 if podziel_na_sekcje:
     sekcja_m = st.sidebar.select_slider(
         "Długość pojedynczej sekcji pikietażu [m]:",
-        options=[250, 500, 1000, 2000],
+        options=[250, 500, 1000, 2000, 5000],
         value=500,
     )
     st.sidebar.markdown("##### Ręczne offsety dla poszczególnych sekcji:")
@@ -1645,9 +1650,16 @@ if bytes_rsp is not None:
 
             st.plotly_chart(fig, use_container_width=True)
 
-            # WYKRESY PODŁUŻNE NA CAŁEJ TRASIE
+            # WYKRESY PODŁUŻNE NA CAŁEJ TRASIE Z DECYMACJĄ WIDOKU
             st.markdown("---")
-            st.subheader("📈 Przebieg Kolein na Całej Trasie (RSP vs LCMS)")
+            st.subheader("📈 Przebieg Kolein na Całej Trasie (Zoptymalizowane dla długich odcinków)")
+            
+            # Bezpieczny render dla ogromnych tras (>100 km)
+            plot_step = max(1, len(df_all_rsp_ruts) // 10000)
+            df_plot = df_all_rsp_ruts.iloc[::plot_step]
+            
+            if plot_step > 1:
+                st.info(f"💡 Ze względu na długość trasy ({len(df_all_rsp_ruts)} profili), wykresy poniżej wyświetlają co {plot_step} profil dla płynności. Obliczenia w tle (DSN/GDDKiA) zawsze wykonują się na 100% profili.")
 
             has_lcms = lcms_profiles is not None and len(lcms_profiles) > 0
 
@@ -1662,8 +1674,8 @@ if bytes_rsp is not None:
                 fig_l = go.Figure()
                 fig_l.add_trace(
                     go.Scatter(
-                        x=df_all_rsp_ruts["Profil"],
-                        y=df_all_rsp_ruts["RSP_Rut_L"],
+                        x=df_plot["Profil"],
+                        y=df_plot["RSP_Rut_L"],
                         mode="lines",
                         name="RSP Koleina Lewa (Łata DSN)",
                         line=dict(color="royalblue", width=2),
@@ -1672,8 +1684,8 @@ if bytes_rsp is not None:
                 if has_lcms:
                     fig_l.add_trace(
                         go.Scatter(
-                            x=df_all_rsp_ruts["Profil"],
-                            y=df_all_rsp_ruts["LCMS_Rut_L"],
+                            x=df_plot["Profil"],
+                            y=df_plot["LCMS_Rut_L"],
                             mode="lines",
                             name="LCMS Lewa (Dopasowana)",
                             line=dict(color="forestgreen", width=2),
@@ -1700,8 +1712,8 @@ if bytes_rsp is not None:
                 fig_r = go.Figure()
                 fig_r.add_trace(
                     go.Scatter(
-                        x=df_all_rsp_ruts["Profil"],
-                        y=df_all_rsp_ruts["RSP_Rut_R"],
+                        x=df_plot["Profil"],
+                        y=df_plot["RSP_Rut_R"],
                         mode="lines",
                         name="RSP Koleina Prawa (Łata DSN)",
                         line=dict(color="darkorange", width=2),
@@ -1710,8 +1722,8 @@ if bytes_rsp is not None:
                 if has_lcms:
                     fig_r.add_trace(
                         go.Scatter(
-                            x=df_all_rsp_ruts["Profil"],
-                            y=df_all_rsp_ruts["LCMS_Rut_R"],
+                            x=df_plot["Profil"],
+                            y=df_plot["LCMS_Rut_R"],
                             mode="lines",
                             name="LCMS Prawa (Dopasowana)",
                             line=dict(color="forestgreen", width=2),
@@ -1738,8 +1750,8 @@ if bytes_rsp is not None:
                 fig_m = go.Figure()
                 fig_m.add_trace(
                     go.Scatter(
-                        x=df_all_rsp_ruts["Profil"],
-                        y=df_all_rsp_ruts["RSP_Rut_Max"],
+                        x=df_plot["Profil"],
+                        y=df_plot["RSP_Rut_Max"],
                         mode="lines",
                         name="RSP Koleina Max (Łata DSN)",
                         line=dict(color="crimson", width=2.5),
@@ -1748,8 +1760,8 @@ if bytes_rsp is not None:
                 if has_lcms:
                     fig_m.add_trace(
                         go.Scatter(
-                            x=df_all_rsp_ruts["Profil"],
-                            y=df_all_rsp_ruts["LCMS_Rut_Max"],
+                            x=df_plot["Profil"],
+                            y=df_plot["LCMS_Rut_Max"],
                             mode="lines",
                             name="LCMS Koleina Max (Dopasowana)",
                             line=dict(color="forestgreen", width=2.5),
@@ -1776,8 +1788,8 @@ if bytes_rsp is not None:
                 fig_all = go.Figure()
                 fig_all.add_trace(
                     go.Scatter(
-                        x=df_all_rsp_ruts["Profil"],
-                        y=df_all_rsp_ruts["RSP_Rut_L"],
+                        x=df_plot["Profil"],
+                        y=df_plot["RSP_Rut_L"],
                         mode="lines",
                         name="RSP Lewa",
                         line=dict(color="royalblue", width=2),
@@ -1785,8 +1797,8 @@ if bytes_rsp is not None:
                 )
                 fig_all.add_trace(
                     go.Scatter(
-                        x=df_all_rsp_ruts["Profil"],
-                        y=df_all_rsp_ruts["RSP_Rut_R"],
+                        x=df_plot["Profil"],
+                        y=df_plot["RSP_Rut_R"],
                         mode="lines",
                         name="RSP Prawa",
                         line=dict(color="darkorange", width=2),
@@ -1796,8 +1808,8 @@ if bytes_rsp is not None:
                 if has_lcms:
                     fig_all.add_trace(
                         go.Scatter(
-                            x=df_all_rsp_ruts["Profil"],
-                            y=df_all_rsp_ruts["LCMS_Rut_L"],
+                            x=df_plot["Profil"],
+                            y=df_plot["LCMS_Rut_L"],
                             mode="lines",
                             name="LCMS Lewa",
                             line=dict(color="forestgreen", width=1.5),
@@ -1806,8 +1818,8 @@ if bytes_rsp is not None:
                     )
                     fig_all.add_trace(
                         go.Scatter(
-                            x=df_all_rsp_ruts["Profil"],
-                            y=df_all_rsp_ruts["LCMS_Rut_R"],
+                            x=df_plot["Profil"],
+                            y=df_plot["LCMS_Rut_R"],
                             mode="lines",
                             name="LCMS Prawa",
                             line=dict(color="limegreen", width=1.5),
