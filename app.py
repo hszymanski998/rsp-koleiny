@@ -1,5 +1,7 @@
 import io
 import os
+import re
+import datetime
 import xml.etree.ElementTree as ET
 import numpy as np
 import pandas as pd
@@ -50,7 +52,7 @@ def get_dsn_color(klasa):
 
 
 # ==========================================
-# 2. PARSERY SUROWYCH PLIKÓW (.RSP, .GPX, .CSV, .XLSX)
+# 2. PARSERY SUROWYCH PLIKÓW (.RSP, .GPX, .CSV, .XLSX, .2025)
 # ==========================================
 def parse_native_rsp_file(file_bytes):
     """Parsuje surowy plik Dynatest .rsp / .txt (linie 5201-5221, 5401, 5280)."""
@@ -180,6 +182,23 @@ def get_file_bytes_and_name(uploaded_file, default_paths):
 @st.cache_data
 def load_rsp_data(file_bytes, file_name):
     """Wczytuje i keszuje dane RSP."""
+    
+    # Dodatkowe zabezpieczenie: jeśli to plik raportu .2025/XML KOLC wrzucony jako profilograf
+    if b"<KOLC" in file_bytes[:1000] or b"<ODCINEK>" in file_bytes[:1000] or file_name.lower().endswith(".2025") or file_name.lower().endswith(".xml"):
+        try:
+            tree = ET.ElementTree(ET.fromstring(file_bytes.decode("utf-8", errors="ignore")))
+            root = tree.getroot()
+            df_data = []
+            prof_idx = 1
+            for odc in root.findall(".//ODCINEK"):
+                df_data.append([prof_idx] + [0.0]*21)
+                prof_idx += 1
+            if df_data:
+                cols = ["Profil"] + [f"L{i+1}" for i in range(21)]
+                return pd.DataFrame(df_data, columns=cols)
+        except Exception:
+            pass
+
     if file_name.lower().endswith(".rsp") or file_name.lower().endswith(".txt"):
         df_prof, _, _ = parse_native_rsp_file(file_bytes)
         if df_prof is not None:
@@ -251,42 +270,82 @@ def parse_rsp_gps_cached(file_bytes, file_name):
 
 @st.cache_data
 def parse_lcms_raw_cached(file_bytes, file_name):
-    """Pancerny parser plików LCMS z obsługą surowego CSV linia po linii."""
+    """Pancerny parser plików LCMS z obsługą surowego CSV linia po linii oraz XML GDDKiA .2025."""
+    
+    # 1. Obsługa plików XML / .2025 z tagami KOLC (GDDKiA)
+    if file_name.lower().endswith(".2025") or file_name.lower().endswith(".xml") or b"<KOLC" in file_bytes[:1000]:
+        try:
+            text = file_bytes.decode("utf-8", errors="ignore")
+            if "<KOLC" in text or "<ODCINEK>" in text:
+                tree = ET.ElementTree(ET.fromstring(text))
+                root = tree.getroot()
+                profiles = {}
+                prof_idx = 1
+                for odc in root.findall(".//ODCINEK"):
+                    try:
+                        l_kol_str = odc.findtext("L_KOL")
+                        p_kol_str = odc.findtext("P_KOL")
+                        rut_l = float(l_kol_str.replace(",", ".")) if l_kol_str and l_kol_str.strip() else 0.0
+                        rut_r = float(p_kol_str.replace(",", ".")) if p_kol_str and p_kol_str.strip() else 0.0
+                        profiles[prof_idx] = {
+                            "x": np.array([]),
+                            "z": np.array([]),
+                            "rut_l": rut_l,
+                            "rut_r": rut_r,
+                        }
+                        prof_idx += 1
+                    except Exception:
+                        continue
+                if profiles:
+                    return profiles
+        except Exception:
+            pass
+
+    # 2. Standardowa obsługa CSV / XLSX z odpornością na przesunięcia
     if file_name.lower().endswith(".xlsx") or file_name.lower().endswith(".xls"):
         df_excel = pd.read_excel(io.BytesIO(file_bytes), header=None)
         raw_rows = []
         for _, r in df_excel.iterrows():
             raw_rows.append([
-                str(v).replace(",", ".").strip() if pd.notna(v) else ""
+                v if pd.notna(v) else ""
                 for v in r.values
             ])
     else:
-        text = file_bytes.decode("utf-8", errors="ignore")
+        try:
+            text = file_bytes.decode("utf-8", errors="ignore")
+        except Exception:
+            text = file_bytes.decode("latin-1", errors="ignore")
         lines = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
         first_line = lines[0] if lines else ""
         sep = ";" if ";" in first_line else ("," if "," in first_line else "\t")
         raw_rows = []
         for line in lines:
-            parts = [p.strip().replace(",", ".") for p in line.split(sep)]
+            parts = [p.strip() for p in line.split(sep)]
             raw_rows.append(parts)
 
     data_row_indices = []
     for idx, row in enumerate(raw_rows):
-        if len(row) > 1:
-            val_a = row[0].replace(".0", "").strip()
+        shift = 0
+        while shift < len(row) and str(row[shift]).strip() == "":
+            shift += 1
+
+        if shift < len(row):
+            val_a = str(row[shift]).replace(".0", "").strip()
             if val_a.isdigit() and len(val_a) > 0:
-                try:
-                    float(row[1])
-                    data_row_indices.append(idx)
-                except ValueError:
-                    pass
+                # Sprawdzenie czy w wierszu są jeszcze inne dane, by uniknąć fałszywych trafień
+                num_count = 0
+                for check_idx in range(shift + 1, min(len(row), shift + 5)):
+                    if str(row[check_idx]).strip():
+                        num_count += 1
+                if num_count > 0:
+                    data_row_indices.append((idx, shift))
 
     profiles = {}
     prof_idx = 1
     for k in range(0, len(data_row_indices) - 1, 2):
-        r_left_h = data_row_indices[k]
+        r_left_h, shift_l = data_row_indices[k]
         r_left_d = r_left_h + 1
-        r_right_h = data_row_indices[k + 1]
+        r_right_h, shift_r = data_row_indices[k + 1]
         r_right_d = r_right_h + 1
 
         if r_right_d >= len(raw_rows):
@@ -298,26 +357,56 @@ def parse_lcms_raw_cached(file_bytes, file_name):
             row_rh = raw_rows[r_right_h]
             row_rd = raw_rows[r_right_d]
 
-            rut_l = float(row_lh[1]) if len(row_lh) > 1 and row_lh[1] != "" else 0.0
-            rut_r = float(row_lh[2]) if len(row_lh) > 2 and row_lh[2] != "" else 0.0
+            rut_l = 0.0
+            rut_r = 0.0
 
-            x_left = [float(v) for v in row_lh[3:] if v != ""]
-            z_left = [float(v) for v in row_ld[3:] if v != ""]
+            def parse_rut(v):
+                if isinstance(v, datetime.datetime):
+                    return float(f"{v.day}.{v.month:02d}")
+                
+                v_str = str(v).replace(",", ".").strip()
+                if v_str == "": return 0.0
+                
+                v_lower = v_str.lower()
+                mies = {"sty": "01", "lut": "02", "mar": "03", "kwi": "04", "maj": "05", "cze": "06", 
+                        "lip": "07", "sie": "08", "wrz": "09", "paź": "10", "paz": "10", "lis": "11", "gru": "12"}
+                for m, num in mies.items():
+                    if m in v_lower:
+                        v_lower = v_lower.replace(m, num)
+                
+                nums = re.findall(r"[-+]?\d*\.\d+|\d+", v_lower)
+                if nums:
+                    return float(nums[0])
+                return 0.0
 
-            x_right = [float(v) for v in row_rh[3:] if v != ""]
-            z_right = [float(v) for v in row_rd[3:] if v != ""]
+            if len(row_lh) > shift_l + 1:
+                rut_l = parse_rut(row_lh[shift_l + 1])
+            if len(row_lh) > shift_l + 2:
+                rut_r = parse_rut(row_lh[shift_l + 2])
+
+            def parse_floats(arr):
+                res = []
+                for v in arr:
+                    v_str = str(v).replace(",", ".").strip()
+                    if v_str == "": continue
+                    try:
+                        res.append(float(v_str))
+                    except ValueError:
+                        pass
+                return res
+
+            x_left = parse_floats(row_lh[shift_l + 3:])
+            z_left = parse_floats(row_ld[shift_l + 3:])
+            x_right = parse_floats(row_rh[shift_r + 3:])
+            z_right = parse_floats(row_rd[shift_r + 3:])
 
             min_len_l = min(len(x_left), len(z_left))
-            x_l_arr, z_l_arr = (
-                np.array(x_left[:min_len_l]),
-                np.array(z_left[:min_len_l]),
-            )
+            x_l_arr = np.array(x_left[:min_len_l])
+            z_l_arr = np.array(z_left[:min_len_l])
 
             min_len_r = min(len(x_right), len(z_right))
-            x_r_arr, z_r_arr = (
-                np.array(x_right[:min_len_r]),
-                np.array(z_right[:min_len_r]),
-            )
+            x_r_arr = np.array(x_right[:min_len_r])
+            z_r_arr = np.array(z_right[:min_len_r])
 
             x_full = np.concatenate([x_l_arr, x_r_arr])
             if len(x_full) > 0 and np.max(np.abs(x_full)) > 20:
@@ -325,16 +414,21 @@ def parse_lcms_raw_cached(file_bytes, file_name):
 
             z_full = np.concatenate([z_l_arr, z_r_arr])
 
-            sort_order = np.argsort(x_full)
-            x_sorted = x_full[sort_order]
-            z_sorted = z_full[sort_order]
-
-            profiles[prof_idx] = {
-                "x": x_sorted,
-                "z": z_sorted,
-                "rut_l": rut_l,
-                "rut_r": rut_r,
-            }
+            if len(x_full) > 0:
+                sort_order = np.argsort(x_full)
+                profiles[prof_idx] = {
+                    "x": x_full[sort_order],
+                    "z": z_full[sort_order],
+                    "rut_l": rut_l,
+                    "rut_r": rut_r,
+                }
+            else:
+                profiles[prof_idx] = {
+                    "x": np.array([]),
+                    "z": np.array([]),
+                    "rut_l": rut_l,
+                    "rut_r": rut_r,
+                }
             prof_idx += 1
         except Exception:
             continue
@@ -427,6 +521,15 @@ def compute_all_rsp_ruts_cached(df_rsp, x_vals_tuple):
     data_mat = df_rsp[laser_cols].values.astype(float)
 
     ile_laserow = data_mat.shape[1]
+    if ile_laserow == 0:
+        # Awaryjny bypass jeśli wgrano XML jako plik RSP
+        return pd.DataFrame({
+            "Profil": prof_ids,
+            "RSP_Rut_L": [0.0]*len(prof_ids),
+            "RSP_Rut_R": [0.0]*len(prof_ids),
+            "RSP_Rut_Max": [0.0]*len(prof_ids),
+        })
+        
     i_min_mid = int(ile_laserow * 0.3)
     i_max_mid = int(ile_laserow * 0.7)
 
@@ -874,8 +977,8 @@ if "offset_pikitaz_input" not in st.session_state:
 # ==========================================
 st.sidebar.header("1. Dane RSP (Profilograf / Surowe)")
 uploaded_rsp = st.sidebar.file_uploader(
-    "Wgraj plik RSP (.rsp / .xlsx / .csv / .txt)",
-    type=["rsp", "xlsx", "csv", "txt"],
+    "Wgraj plik RSP (.rsp / .xlsx / .csv / .txt / .2025 / .xml)",
+    type=["rsp", "xlsx", "csv", "txt", "2025", "xml"],
     key="rsp_input",
 )
 uploaded_rsp_gps = st.sidebar.file_uploader(
@@ -884,9 +987,9 @@ uploaded_rsp_gps = st.sidebar.file_uploader(
     key="rsp_gps_input",
 )
 
-st.sidebar.header("2. Dane LCMS (Surowe CSV / Excel)")
+st.sidebar.header("2. Dane LCMS (Surowe CSV / Excel / XML)")
 uploaded_lcms = st.sidebar.file_uploader(
-    "Wgraj plik LCMS (.csv / .xlsx)", type=["csv", "xlsx"], key="lcms_input"
+    "Wgraj plik LCMS (.csv / .xlsx / .2025 / .xml)", type=["csv", "xlsx", "2025", "xml"], key="lcms_input"
 )
 uploaded_xml = st.sidebar.file_uploader(
     "Wgraj plik XML z LCMS (GPS)", type=["xml"], key="xml_input"
@@ -898,9 +1001,11 @@ bytes_rsp, name_rsp = get_file_bytes_and_name(
         "data/rsp.rsp",
         "data/rsp.xlsx",
         "data/rsp.csv",
+        "data/rsp.2025",
         "rsp.rsp",
         "rsp.xlsx",
         "rsp.csv",
+        "rsp.2025",
     ],
 )
 bytes_rsp_gps, name_rsp_gps = get_file_bytes_and_name(
@@ -914,7 +1019,7 @@ bytes_rsp_gps, name_rsp_gps = get_file_bytes_and_name(
     ],
 )
 bytes_lcms, name_lcms = get_file_bytes_and_name(
-    uploaded_lcms, ["data/lcms.csv", "data/lcms.xlsx", "lcms.csv", "lcms.xlsx"]
+    uploaded_lcms, ["data/lcms.csv", "data/lcms.xlsx", "data/lcms.2025", "lcms.csv", "lcms.xlsx", "lcms.2025"]
 )
 bytes_xml, name_xml = get_file_bytes_and_name(
     uploaded_xml, ["data/lcms.xml", "lcms.xml"]
@@ -1207,50 +1312,59 @@ if bytes_rsp is not None:
         odczyty_raw = wiersz_rsp.iloc[0][kolumny_laserow].values.astype(float)
         ile_laserow = len(odczyty_raw)
 
-        x_vals = (
-            pozycja_x
-            if len(pozycja_x) == ile_laserow
-            else [
-                round((i - (ile_laserow - 1) / 2) * 0.165, 3)
-                for i in range(ile_laserow)
-            ]
-        )
-
-        if tryb_zero_l11:
-            idx_srodek = ile_laserow // 2
-            ref_val = odczyty_raw[idx_srodek]
-            y_vals = ref_val - odczyty_raw
-            y_label = "Wysokość względna do L11 [mm]"
+        # Bezpiecznik jeśli ktoś załaduje plik bez laserów (XML)
+        if ile_laserow == 0:
+            x_vals = []
+            y_vals = []
+            idx_srodek = 0
+            y_label = "Brak profilu"
         else:
-            y_vals = odczyty_raw
-            y_label = "Odczyt surowy czujnika [mm]"
+            x_vals = (
+                pozycja_x
+                if len(pozycja_x) == ile_laserow
+                else [
+                    round((i - (ile_laserow - 1) / 2) * 0.165, 3)
+                    for i in range(ile_laserow)
+                ]
+            )
 
-        i_min_mid = int(ile_laserow * 0.3)
-        i_max_mid = int(ile_laserow * 0.7)
-        idx_crown = i_min_mid + np.argmax(y_vals[i_min_mid : i_max_mid + 1])
+            if tryb_zero_l11:
+                idx_srodek = ile_laserow // 2
+                ref_val = odczyty_raw[idx_srodek]
+                y_vals = ref_val - odczyty_raw
+                y_label = "Wysokość względna do L11 [mm]"
+            else:
+                y_vals = odczyty_raw
+                y_label = "Odczyt surowy czujnika [mm]"
 
-        x_left, y_left = (
-            np.array(x_vals[: idx_crown + 1]),
-            np.array(y_vals[: idx_crown + 1]),
-        )
-        x_right, y_right = (
-            np.array(x_vals[idx_crown:]),
-            np.array(y_vals[idx_crown:]),
-        )
+        if ile_laserow > 0:
+            i_min_mid = int(ile_laserow * 0.3)
+            i_max_mid = int(ile_laserow * 0.7)
+            idx_crown = i_min_mid + np.argmax(y_vals[i_min_mid : i_max_mid + 1])
 
-        lata_lewa_y = get_upper_hull(x_left, y_left)
-        lata_prawa_y = get_upper_hull(x_right, y_right)
+            x_left, y_left = (
+                np.array(x_vals[: idx_crown + 1]),
+                np.array(y_vals[: idx_crown + 1]),
+            )
+            x_right, y_right = (
+                np.array(x_vals[idx_crown:]),
+                np.array(y_vals[idx_crown:]),
+            )
 
-        diff_l = lata_lewa_y - y_left
-        idx_kol_l = np.argmax(diff_l)
-        koleina_lewa_mm = diff_l[idx_kol_l]
+            lata_lewa_y = get_upper_hull(x_left, y_left)
+            lata_prawa_y = get_upper_hull(x_right, y_right)
 
-        diff_p = lata_prawa_y - y_right
-        idx_kol_p_rel = np.argmax(diff_p)
-        idx_kol_p = idx_crown + idx_kol_p_rel
-        koleina_prawa_mm = diff_p[idx_kol_p_rel]
+            diff_l = lata_lewa_y - y_left
+            idx_kol_l = np.argmax(diff_l)
+            koleina_lewa_mm = diff_l[idx_kol_l]
 
-        max_koleina_rsp = max(koleina_lewa_mm, koleina_prawa_mm)
+            diff_p = lata_prawa_y - y_right
+            idx_kol_p_rel = np.argmax(diff_p)
+            idx_kol_p = idx_crown + idx_kol_p_rel
+            koleina_prawa_mm = diff_p[idx_kol_p_rel]
+            max_koleina_rsp = max(koleina_lewa_mm, koleina_prawa_mm)
+        else:
+            koleina_lewa_mm, koleina_prawa_mm, max_koleina_rsp = 0.0, 0.0, 0.0
 
         kol_lcms_l, kol_lcms_p = None, None
         prof_lcms_data = None
@@ -1260,7 +1374,7 @@ if bytes_rsp is not None:
             kol_lcms_p = prof_lcms_data.get("rut_r", None)
 
         calc_lcms_rut_l, calc_lcms_rut_r = None, None
-        if prof_lcms_data is not None:
+        if prof_lcms_data is not None and len(prof_lcms_data.get("x", [])) > 0:
             x_lcms_orig = prof_lcms_data["x"].copy()
             z_lcms_raw = prof_lcms_data["z"]
             z_lcms_smooth = smooth_profile(z_lcms_raw, window_size=31)
@@ -1283,6 +1397,8 @@ if bytes_rsp is not None:
 
             calc_lcms_rut_l = float(np.max(lata_raw_l - z_lcms_l_raw))
             calc_lcms_rut_r = float(np.max(lata_raw_r - z_lcms_r_raw))
+        elif prof_lcms_data is not None:
+            calc_lcms_rut_l, calc_lcms_rut_r = 0.0, 0.0
 
         # --- ZAKŁADKA 1: PRZEKRÓJ POPRZECZNY I CAŁA TRASA ---
         with tab_main:
@@ -1312,16 +1428,17 @@ if bytes_rsp is not None:
             klasa_rsp_p = get_dsn_class(koleina_prawa_mm)
             klasa_rsp_m = get_dsn_class(max_koleina_rsp)
 
-            rc1.metric(
-                "RSP Koleina Lewa",
-                f"{koleina_lewa_mm:.1f} mm (Klasa {klasa_rsp_l})",
-                f"Laser L{idx_kol_l+1} ({x_vals[idx_kol_l]:.2f}m)",
-            )
-            rc2.metric(
-                "RSP Koleina Prawa",
-                f"{koleina_prawa_mm:.1f} mm (Klasa {klasa_rsp_p})",
-                f"Laser L{idx_kol_p+1} ({x_vals[idx_kol_p]:.2f}m)",
-            )
+            if ile_laserow > 0:
+                rc1.metric(
+                    "RSP Koleina Lewa",
+                    f"{koleina_lewa_mm:.1f} mm (Klasa {klasa_rsp_l})",
+                    f"Laser L{idx_kol_l+1} ({x_vals[idx_kol_l]:.2f}m)",
+                )
+                rc2.metric(
+                    "RSP Koleina Prawa",
+                    f"{koleina_prawa_mm:.1f} mm (Klasa {klasa_rsp_p})",
+                    f"Laser L{idx_kol_p+1} ({x_vals[idx_kol_p]:.2f}m)",
+                )
             rc3.metric(
                 "RSP Koleina Maksymalna",
                 f"{max_koleina_rsp:.1f} mm (Klasa {klasa_rsp_m})",
@@ -1368,106 +1485,107 @@ if bytes_rsp is not None:
             # WYKRES PRZEKROJU POPRZECZNEGO
             fig = go.Figure()
 
-            fig.add_trace(
-                go.Scatter(
-                    x=x_vals,
-                    y=y_vals,
-                    mode="lines+markers",
-                    name="Profil RSP (Spline)",
-                    line=dict(
-                        shape="spline",
-                        smoothing=1.2,
-                        color="royalblue",
-                        width=3,
-                    ),
-                    marker=dict(size=7, color="navy"),
-                    hovertemplate=(
-                        "Poz X: %{x} m<br>Wys Y: %{y:.1f} mm<extra></extra>"
-                    ),
-                )
-            )
-
-            if pokaz_late_rsp:
+            if ile_laserow > 0:
                 fig.add_trace(
                     go.Scatter(
-                        x=x_left,
-                        y=lata_lewa_y,
-                        mode="lines",
-                        name="Łata RSP Lewa",
-                        line=dict(color="crimson", width=2),
-                    )
-                )
-                fig.add_trace(
-                    go.Scatter(
-                        x=x_right,
-                        y=lata_prawa_y,
-                        mode="lines",
-                        name="Łata RSP Prawa",
-                        line=dict(color="darkorange", width=2),
-                    )
-                )
-
-                x_kl, y_kl_prof, y_kl_lata = (
-                    x_vals[idx_kol_l],
-                    y_vals[idx_kol_l],
-                    lata_lewa_y[idx_kol_l],
-                )
-                fig.add_trace(
-                    go.Scatter(
-                        x=[x_kl, x_kl],
-                        y=[y_kl_lata, y_kl_prof],
+                        x=x_vals,
+                        y=y_vals,
                         mode="lines+markers",
-                        name=f"Głębokość RSP Lewa ({koleina_lewa_mm:.1f} mm)",
-                        line=dict(color="crimson", width=3),
-                        marker=dict(size=6, symbol="triangle-down"),
+                        name="Profil RSP (Spline)",
+                        line=dict(
+                            shape="spline",
+                            smoothing=1.2,
+                            color="royalblue",
+                            width=3,
+                        ),
+                        marker=dict(size=7, color="navy"),
+                        hovertemplate=(
+                            "Poz X: %{x} m<br>Wys Y: %{y:.1f} mm<extra></extra>"
+                        ),
                     )
                 )
-                fig.add_annotation(
-                    x=x_kl,
-                    y=(y_kl_lata + y_kl_prof) / 2,
-                    text=f" <b>RSP: {koleina_lewa_mm:.1f} mm</b>",
-                    showarrow=False,
-                    font=dict(color="crimson", size=12),
-                    bgcolor="rgba(255, 255, 255, 0.95)",
-                    bordercolor="crimson",
-                    borderwidth=1,
-                    xanchor="right",
-                )
 
-                x_kp, y_kp_prof, y_kp_lata = (
-                    x_vals[idx_kol_p],
-                    y_vals[idx_kol_p],
-                    lata_prawa_y[idx_kol_p_rel],
-                )
-                fig.add_trace(
-                    go.Scatter(
-                        x=[x_kp, x_kp],
-                        y=[y_kp_lata, y_kp_prof],
-                        mode="lines+markers",
-                        name=f"Głębokość RSP Prawa ({koleina_prawa_mm:.1f} mm)",
-                        line=dict(color="darkorange", width=3),
-                        marker=dict(size=6, symbol="triangle-down"),
+                if pokaz_late_rsp:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=x_left,
+                            y=lata_lewa_y,
+                            mode="lines",
+                            name="Łata RSP Lewa",
+                            line=dict(color="crimson", width=2),
+                        )
                     )
-                )
-                fig.add_annotation(
-                    x=x_kp,
-                    y=(y_kp_prof + y_kp_lata) / 2,
-                    text=f" <b>RSP: {koleina_prawa_mm:.1f} mm</b>",
-                    showarrow=False,
-                    font=dict(color="darkorange", size=12),
-                    bgcolor="rgba(255, 255, 255, 0.95)",
-                    bordercolor="darkorange",
-                    borderwidth=1,
-                    xanchor="right",
-                )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=x_right,
+                            y=lata_prawa_y,
+                            mode="lines",
+                            name="Łata RSP Prawa",
+                            line=dict(color="darkorange", width=2),
+                        )
+                    )
 
-            if prof_lcms_data is not None:
+                    x_kl, y_kl_prof, y_kl_lata = (
+                        x_vals[idx_kol_l],
+                        y_vals[idx_kol_l],
+                        lata_lewa_y[idx_kol_l],
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[x_kl, x_kl],
+                            y=[y_kl_lata, y_kl_prof],
+                            mode="lines+markers",
+                            name=f"Głębokość RSP Lewa ({koleina_lewa_mm:.1f} mm)",
+                            line=dict(color="crimson", width=3),
+                            marker=dict(size=6, symbol="triangle-down"),
+                        )
+                    )
+                    fig.add_annotation(
+                        x=x_kl,
+                        y=(y_kl_lata + y_kl_prof) / 2,
+                        text=f" <b>RSP: {koleina_lewa_mm:.1f} mm</b>",
+                        showarrow=False,
+                        font=dict(color="crimson", size=12),
+                        bgcolor="rgba(255, 255, 255, 0.95)",
+                        bordercolor="crimson",
+                        borderwidth=1,
+                        xanchor="right",
+                    )
+
+                    x_kp, y_kp_prof, y_kp_lata = (
+                        x_vals[idx_kol_p],
+                        y_vals[idx_kol_p],
+                        lata_prawa_y[idx_kol_p_rel],
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[x_kp, x_kp],
+                            y=[y_kp_lata, y_kp_prof],
+                            mode="lines+markers",
+                            name=f"Głębokość RSP Prawa ({koleina_prawa_mm:.1f} mm)",
+                            line=dict(color="darkorange", width=3),
+                            marker=dict(size=6, symbol="triangle-down"),
+                        )
+                    )
+                    fig.add_annotation(
+                        x=x_kp,
+                        y=(y_kp_prof + y_kp_lata) / 2,
+                        text=f" <b>RSP: {koleina_prawa_mm:.1f} mm</b>",
+                        showarrow=False,
+                        font=dict(color="darkorange", size=12),
+                        bgcolor="rgba(255, 255, 255, 0.95)",
+                        bordercolor="darkorange",
+                        borderwidth=1,
+                        xanchor="right",
+                    )
+
+            if prof_lcms_data is not None and len(prof_lcms_data.get("x", [])) > 0:
                 x_lcms_orig = prof_lcms_data["x"].copy()
                 z_lcms_raw = prof_lcms_data["z"]
                 z_lcms_smooth = smooth_profile(z_lcms_raw, window_size=31)
 
-                rsp_x_max = np.max(x_vals)
-                rsp_x_min = np.min(x_vals)
+                rsp_x_max = np.max(x_vals) if ile_laserow > 0 else 1.5
+                rsp_x_min = np.min(x_vals) if ile_laserow > 0 else -1.5
 
                 x_lcms = x_lcms_orig.copy()
 
