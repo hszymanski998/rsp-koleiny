@@ -425,8 +425,17 @@ def compute_all_rsp_ruts_cached(df_rsp, x_vals_tuple):
     col_profil = "Profil" if "Profil" in df_rsp.columns else df_rsp.columns[0]
     laser_cols = [c for c in df_rsp.columns if c != col_profil]
 
+    # PANCERNA ZAPORA: Wymuszamy konwersję na liczby dla wszystkich kolumn laserów.
+    # Wszelkie teksty z XML (np. '-->') czy daty z polskiego Excela (np. '05.lut') stają się bezpiecznymi NaN.
+    for col in laser_cols:
+        df_rsp[col] = pd.to_numeric(
+            df_rsp[col].astype(str).str.replace(",", "."), errors="coerce"
+        )
+
     prof_ids = df_rsp[col_profil].values
-    data_mat = df_rsp[laser_cols].values.astype(float)
+    
+    # Zastępujemy puste luki (NaN) zerami, by astype(float) nigdy więcej nie rzuciło błędu
+    data_mat = df_rsp[laser_cols].fillna(0.0).values.astype(float)
 
     ile_laserow = data_mat.shape[1]
     i_min_mid = int(ile_laserow * 0.3)
@@ -437,15 +446,35 @@ def compute_all_rsp_ruts_cached(df_rsp, x_vals_tuple):
     x_arr = np.array(x_vals_tuple)
 
     for row in y_mat:
-        idx_crown = i_min_mid + np.argmax(row[i_min_mid : i_max_mid + 1])
-        x_left, y_left = x_arr[: idx_crown + 1], row[: idx_crown + 1]
-        x_right, y_right = x_arr[idx_crown:], row[idx_crown:]
+        # Zabezpieczenie, jeśli plik XML/surowy uciął liczbę kolumn
+        min_len = min(len(x_arr), len(row))
+        if min_len < 3:
+            ruts_l.append(0.0)
+            ruts_r.append(0.0)
+            continue
+            
+        row_trunc = row[:min_len]
+        x_trunc = x_arr[:min_len]
+        
+        # Wyliczanie indeksów podziału dla dostępnej liczby czujników
+        i_mid_adj = int(min_len * 0.3)
+        i_max_adj = int(min_len * 0.7)
+        if i_mid_adj >= i_max_adj:
+            idx_crown = min_len // 2
+        else:
+            idx_crown = i_mid_adj + np.argmax(row_trunc[i_mid_adj : i_max_adj + 1])
+
+        x_left, y_left = x_trunc[: idx_crown + 1], row_trunc[: idx_crown + 1]
+        x_right, y_right = x_trunc[idx_crown:], row_trunc[idx_crown:]
 
         lata_l = get_upper_hull(x_left, y_left)
         lata_r = get_upper_hull(x_right, y_right)
 
-        ruts_l.append(float(np.max(lata_l - y_left)))
-        ruts_r.append(float(np.max(lata_r - y_right)))
+        val_l = float(np.max(lata_l - y_left)) if len(y_left) > 0 else 0.0
+        val_r = float(np.max(lata_r - y_right)) if len(y_right) > 0 else 0.0
+
+        ruts_l.append(val_l)
+        ruts_r.append(val_r)
 
     return pd.DataFrame({
         "Profil": prof_ids,
@@ -453,7 +482,6 @@ def compute_all_rsp_ruts_cached(df_rsp, x_vals_tuple):
         "RSP_Rut_R": ruts_r,
         "RSP_Rut_Max": np.maximum(ruts_l, ruts_r),
     })
-
 
 @st.cache_data
 def compute_all_lcms_calc_ruts_cached(lcms_profiles):
