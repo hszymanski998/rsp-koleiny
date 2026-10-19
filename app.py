@@ -3567,13 +3567,10 @@ def tab_cross(A):
     row = p[p["Pikietaz"] == chain]
     if len(row):
         r = row.iloc[0]
-        m = st.columns(6)
-        m[0].metric("RSP lewa", nice_number(r.get("RSP_L"), 1))
-        m[1].metric("LCMS lewa", nice_number(r.get("LCMS_L"), 1), delta=nice_number(r.get("LCMS_L") - r.get("RSP_L"), 1))
-        m[2].metric("RSP prawa", nice_number(r.get("RSP_R"), 1))
-        m[3].metric("LCMS prawa", nice_number(r.get("LCMS_R"), 1), delta=nice_number(r.get("LCMS_R") - r.get("RSP_R"), 1))
-        m[4].metric("RSP max", nice_number(r.get("RSP_Max"), 1))
-        m[5].metric("LCMS max", nice_number(r.get("LCMS_Max"), 1), delta=nice_number(r.get("LCMS_Max") - r.get("RSP_Max"), 1))
+        for col_, (k, lab) in zip(st.columns(3), (("L", "lewa"), ("R", "prawa"), ("Max", "maksymalna"))):
+            rv, lv = r.get("RSP_" + k), r.get("LCMS_" + k)
+            col_.metric(f"RSP {lab}", nice_number(rv, 1) + " mm")
+            col_.metric(f"LCMS {lab}", nice_number(lv, 1) + " mm", delta=nice_number(lv - rv, 1) + " mm")
     if rs is not None and lc is not None:
         st.caption(f"Z geometrii wykresu: RSP lewa {rs['rut_l']:.1f}, prawa {rs['rut_r']:.1f} mm; "
                    f"LCMS (wirtualna łata) lewa {lc['rut_l_calc']:.1f}, prawa {lc['rut_r_calc']:.1f} mm.")
@@ -3596,6 +3593,53 @@ def tab_cross(A):
 
 
 # ---------- PRZEBIEG WZDŁUŻNY ----------
+@st.cache_data(show_spinner=False, max_entries=16)
+def cached_segment_lags(ch, a, b, seg_len, max_lag, hp, min_corr):
+    """Dla kolejnych segmentów RSP szuka dodatkowego przesunięcia LCMS (maks. korelacji)."""
+    ah, bh = highpass(a, hp), highpass(b, hp)
+    c0 = float(ch[0])
+    lags = np.arange(-max_lag, max_lag + 1)
+    rows = []
+    for st_ in np.arange(c0, ch[-1] + 1, seg_len):
+        i0 = int(st_ - c0)
+        i1 = min(len(ch), int(st_ + seg_len - c0))
+        if i1 - i0 < 30:
+            continue
+        corr = corr_vs_lag(ah[i0:i1], bh, st_, c0, lags)
+        lag, c, _ = best_lag(corr, lags)
+        before = float(corr[max_lag]) if not np.isnan(corr[max_lag]) else np.nan
+        if np.isnan(lag) or np.isnan(c) or c < min_corr:
+            lag = 0.0
+        rows.append({"Od [m]": float(st_), "Do [m]": float(st_ + seg_len - 1), "Dodatkowe przesunięcie [m]": float(lag),
+                     "r przed": before, "r po": c})
+    return pd.DataFrame(rows)
+
+
+def apply_segment_shifts(p, seg_df, seg_len):
+    """Kopia tabeli porównawczej, w której LCMS jest przesunięty osobno w każdym segmencie."""
+    q = p.copy()
+    ch = p["Pikietaz"].values
+    c0 = float(ch[0])
+    for col in ("L", "R", "Max"):
+        src = p["LCMS_" + col].values.astype(float)
+        out = np.full(len(src), np.nan)
+        for _, r in seg_df.iterrows():
+            i0 = max(0, int(r["Od [m]"] - c0))
+            i1 = min(len(ch), int(r["Od [m]"] + seg_len - c0))
+            idx = np.arange(i0, i1) + int(round(r["Dodatkowe przesunięcie [m]"]))
+            ok = (idx >= 0) & (idx < len(src))
+            seg = np.full(i1 - i0, np.nan)
+            seg[ok] = src[idx[ok]]
+            out[i0:i1] = seg
+        q["LCMS_" + col] = out
+    return q
+
+
+def view_overlaps(x, A, v0, span):
+    hi = v0 + span if span > 0 else A["a1"]
+    return v0 <= x <= hi
+
+
 def tab_long(A):
     st.subheader("Przebieg wzdłużny koleiny")
     p = A["pairs"]
@@ -3606,12 +3650,46 @@ def tab_long(A):
     view = (v0, min(hi, v0 + span)) if span > 0 else (lo, hi)
     bands = st.checkbox("Pokaż klasy DSN (tło)", True, key="lg_bands")
     both = A["lcms_source"] == "both" and "LCMSc_L" in p.columns
+    marks = []
+    with st.expander("Dopasowanie segmentów (lokalne przesunięcie LCMS na tym samym wykresie)"):
+        st.caption("Trasa jest dzielona na segmenty; w każdym LCMS jest osobno przesuwany względem RSP (maksimum korelacji), "
+                   "dzięki czemu na wykresie nie ma narastających przesunięć. Wartości możesz poprawić ręcznie.")
+        on = st.checkbox("Włącz dopasowanie segmentów", False, key="sg_on")
+        g1, g2, g3, g4, g5 = st.columns(5)
+        seg_len = g1.number_input("Długość segmentu [m]", 50, 5000, 250, 50, key="sg_len")
+        max_lag = g2.number_input("Maks. przesunięcie ± [m]", 2, 300, 30, 2, key="sg_max")
+        col_ = g3.selectbox("Seria do dopasowania", ["Max", "L", "R"], key="sg_col")
+        hp_ = g4.number_input("Filtr górnoprzepustowy [m]", 0, 1001, 101, 10, key="sg_hp")
+        mc_ = g5.number_input("Min. korelacja", 0.0, 1.0, 0.2, 0.05, key="sg_minc")
+        if on:
+            sig = (int(seg_len), int(max_lag), col_, int(hp_), float(mc_), float(A["a0"]), float(A["a1"]),
+                   round(float(st.session_state.get("off_global", 0.0)), 3), round(float(st.session_state.get("off_drift", 0.0)), 4))
+            if st.session_state.get("sg_sig") != sig:
+                auto = cached_segment_lags(p["Pikietaz"].values, p["RSP_" + col_].values, p["LCMS_" + col_].values,
+                                           int(seg_len), int(max_lag), int(hp_), float(mc_))
+                st.session_state["sg_df"] = auto
+                st.session_state["sg_sig"] = sig
+            sdf = st.session_state["sg_df"]
+            ed = wide(st.data_editor, sdf, hide_index=True, key="sg_editor",
+                      disabled=["Od [m]", "Do [m]", "r przed", "r po"])
+            seg_df = ed
+            if len(seg_df):
+                p = apply_segment_shifts(p, seg_df, int(seg_len))
+                marks = [(float(x), "") for x in seg_df["Od [m]"].values if view_overlaps(x, A, v0, span)]
+                st.write(f"Mediana r: przed **{np.nanmedian(seg_df['r przed']):.2f}**, po **{np.nanmedian(seg_df['r po']):.2f}**; "
+                         f"przesunięcia od {seg_df['Dodatkowe przesunięcie [m]'].min():+.0f} do {seg_df['Dodatkowe przesunięcie [m]'].max():+.0f} m.")
+                if st.button("Zastosuj jako offsety sekcji w całej analizie", key="sg_apply"):
+                    mids = seg_df["Od [m]"].values + float(seg_len) / 2.0
+                    tot = A["off_fn"](mids) + seg_df["Dodatkowe przesunięcie [m]"].values
+                    st.session_state["sec_off_df"] = pd.DataFrame({"Od [m]": seg_df["Od [m]"].values, "Offset [m]": tot})
+                    st.session_state["sg_sig"] = None
+                    set_pending(off_global=0.0, off_drift=0.0, off_ref=float(A["a0"]))
     for key, lab in (("Max", "maksymalna"), ("L", "lewa"), ("R", "prawa")):
         tr = [{"col": f"RSP_{key}", "name": f"RSP {lab}", "color": C_RSP},
               {"col": f"LCMS_{key}", "name": f"LCMS {lab}", "color": C_LCMS}]
         if both:
             tr.append({"col": f"LCMSc_{key}", "name": f"LCMS (łata) {lab}", "color": "#8fd18f", "dash": "dot"})
-        plot(fig_longitudinal(p, tr, f"Koleina {lab} – RSP vs LCMS", view, bands=bands, uirev="lg" + key), "lg_" + key)
+        plot(fig_longitudinal(p, tr, f"Koleina {lab} – RSP vs LCMS", view, bands=bands, uirev="lg" + key, extra_vlines=marks), "lg_" + key)
     roll = st.slider("Okno średniej kroczącej różnicy [m]", 11, 1001, 101, 10, key="lg_roll")
     plot(fig_diff_along(p, view=view, roll=roll, tol=A["tol"], uirev="lgd"), "lg_diff")
     with st.expander("Największe rozbieżności (|LCMS − RSP| dla koleiny maks., średnia z 20 m)"):
