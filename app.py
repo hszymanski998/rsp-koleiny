@@ -1376,7 +1376,7 @@ def merge_lcms(entries, reverse=False, notes=None):
             continue
         s = e["src"]
         nat = native_chain(s, e.get("guess_start", 0.0), e.get("step_m", 1.0))
-        shift = float(e.get("start_m", nat[0] if len(nat) else 0.0)) - float(nat[0])
+        shift = float(e.get("start_m", nat.min() if len(nat) else 0.0)) - float(nat.min())
         parts.append((s, nat + shift, len(names)))
         names.append(e["name"])
     if not parts:
@@ -1427,7 +1427,7 @@ def merge_rsp(entries, notes=None):
             continue
         s = e["src"]
         nat = native_chain(s, 0.0, e.get("step_m", 1.0))
-        shift = float(e.get("start_m", nat[0] if len(nat) else 0.0)) - float(nat[0])
+        shift = float(e.get("start_m", nat.min() if len(nat) else 0.0)) - float(nat.min())
         k = len(names)
         names.append(e["name"])
         (raws if e["type"] == TYPE_RSP_RAW else kolcs).append((s, nat + shift, k, shift))
@@ -1512,7 +1512,7 @@ def merge_gps(entries, prof_range, kinds, camera="auto", notes=None, label="GPS"
             g = s["gps"][["chain_m", "LAT", "LON"]].copy()
             # GPS wbudowany dziedziczy korektę pikietażu pliku nadrzędnego
             nat = native_chain(s, 0.0, e.get("step_m", 1.0))
-            shift = float(e.get("start_m", nat[0])) - float(nat[0])
+            shift = float(e.get("start_m", nat.min())) - float(nat.min())
             g["chain_m"] = g["chain_m"] + shift
             parts.append((g, s["gps"].attrs.get("chain_kind", "km"), e["name"] + " (wbudowany)", 1))
     if not parts:
@@ -2315,6 +2315,48 @@ def gps_track_separation(rsp_gps, lcms_gps, off_fn, chains):
     return pd.DataFrame({"Pikietaz": c, "Dystans [m]": d})
 
 
+def optimize_linear(a_chain, a, b, b_c0, ref, off_center=0.0, off_span=40.0, drift_span=1.5, min_n=500):
+    """Szuka offsetu i dryfu (LCMS = RSP + offset + dryf·(x−ref)/1000) maksymalizującego korelację surowych serii.
+
+    a – seria RSP na pikietażach a_chain (siatka 1 m), b – seria LCMS na siatce 1 m od b_c0.
+    Zwraca (r, offset, dryf [m/km]); gruby przegląd + zawężenie.
+    """
+    a_chain = np.asarray(a_chain, dtype=float)
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    ok_a = ~np.isnan(a)
+    ch, av = a_chain[ok_a], a[ok_a]
+    if len(ch) < min_n:
+        return np.nan, off_center, 0.0
+    step = max(1, len(ch) // 6000)
+    ch, av = ch[::step], av[::step]
+
+    def corr(off, dr):
+        idx = np.rint(ch + off + dr * (ch - ref) / 1000.0 - b_c0).astype(np.int64)
+        m = (idx >= 0) & (idx < len(b))
+        if m.sum() < min_n * 0.5:
+            return np.nan
+        x, y = av[m], b[idx[m]]
+        v = ~np.isnan(y)
+        if v.sum() < min_n * 0.5 or np.std(x[v]) == 0 or np.std(y[v]) == 0:
+            return np.nan
+        return float(np.corrcoef(x[v], y[v])[0, 1])
+
+    best = (-2.0, off_center, 0.0)
+    for off in np.arange(off_center - off_span, off_center + off_span + 0.1, 2.0):
+        for dr in np.arange(-drift_span, drift_span + 1e-9, 0.25):
+            r = corr(off, dr)
+            if not np.isnan(r) and r > best[0]:
+                best = (r, off, dr)
+    r0, o0, d0 = best
+    for off in np.arange(o0 - 3.0, o0 + 3.01, 0.5):
+        for dr in np.arange(d0 - 0.25, d0 + 0.2501, 0.05):
+            r = corr(off, dr)
+            if not np.isnan(r) and r > best[0]:
+                best = (r, off, dr)
+    return best
+
+
 # ==========================================================================
 # 8. AUTOMATYCZNE WNIOSKI
 # ==========================================================================
@@ -2329,13 +2371,22 @@ def agreement_grade(st, tol=2.0):
     if not st or st.get("n", 0) < 3 or np.isnan(st.get("ccc", np.nan)):
         return "brak danych", "info"
     ccc, wt = st["ccc"], st.get("within_tol", 0.0)
-    if ccc >= 0.95 and wt >= 90:
+    w3, w5 = st.get("within_3", 0.0), st.get("within_5", 0.0)
+    if ccc >= 0.95 and wt >= 85:
         return "bardzo dobra", "ok"
-    if ccc >= 0.85 and wt >= 75:
+    if ccc >= 0.85 and (wt >= 70 or w3 >= 60):
         return "dobra", "ok"
-    if ccc >= 0.65 and wt >= 50:
+    if ccc >= 0.65 and w5 >= 50:
         return "umiarkowana", "warn"
     return "niska", "bad"
+
+
+def shape_txt(r):
+    if r >= 0.8:
+        return "oba systemy zgodnie wskazują, gdzie koleina jest głębsza, a gdzie płytsza"
+    if r >= 0.6:
+        return "oba systemy w dużej mierze zgadzają się co do tego, gdzie koleina jest głębsza, a gdzie płytsza"
+    return "oba systemy tylko częściowo zgadzają się co do kształtu przebiegu (możliwe niedopasowanie pikietażu lub pasa pomiarowego)"
 
 
 def build_conclusions(ctx):
@@ -2394,18 +2445,33 @@ def build_conclusions(ctx):
             continue
         grade, kind = agreement_grade(st_, tol)
         sig = not (st_["bias_ci_lo"] <= 0 <= st_["bias_ci_hi"])
-        who = "LCMS wskazuje **głębsze**" if st_["bias"] > 0 else "LCMS wskazuje **płytsze**"
-        bias_txt = (f"{who} koleiny o średnio **{abs(st_['bias']):.2f} mm** (95% CI {_f(st_['bias_ci_lo'], 2, True)} … "
-                    f"{_f(st_['bias_ci_hi'], 2, True)}; n_eff ≈ {st_['n_eff']:.0f})" if sig else
-                    f"brak istotnego błędu systematycznego (bias {_f(st_['bias'], 2, True)} mm, 95% CI "
-                    f"{_f(st_['bias_ci_lo'], 2, True)} … {_f(st_['bias_ci_hi'], 2, True)})")
-        txt = (f"Zgodność **{grade}**. {bias_txt}. Granice zgodności (±1.96 SD): "
-               f"**{_f(st_['loa_lo'], 1, True)} … {_f(st_['loa_hi'], 1, True)} mm**, RMSE {st_['rmse']:.2f} mm, "
-               f"MAE {st_['mae']:.2f} mm. W tolerancji ±{tol:g} mm: **{st_['within_tol']:.0f}%** punktów "
-               f"(±1 mm: {st_['within_1']:.0f}%, ±3 mm: {st_['within_3']:.0f}%, ±5 mm: {st_['within_5']:.0f}%). "
-               f"Korelacja r = **{st_['pearson']:.2f}** ({corr_label(st_['pearson'])}), CCC Lina = {st_['ccc']:.2f}, "
-               f"ICC(A,1) = {st_['icc']:.2f}.")
+        ab = abs(st_["bias"])
+        who = "głębsze" if st_["bias"] > 0 else "płytsze"
+        if ab < 0.3:
+            bias_txt = f"Średnio oba systemy dają to samo (różnica {_f(st_['bias'], 2, True)} mm)"
+        elif ab < 1.5:
+            bias_txt = (f"LCMS pokazuje średnio koleiny o **{ab:.1f} mm {who}** niż RSP" +
+                        (" – różnica jest stała i statystycznie wykrywalna, ale w praktyce mała (rzędu niepewności pomiaru każdego z systemów)"
+                         if sig else " – różnica nieistotna statystycznie"))
+        else:
+            bias_txt = f"LCMS pokazuje średnio koleiny o **{ab:.1f} mm {who}** niż RSP – to już zauważalna różnica systematyczna"
+        txt = (f"Zgodność **{grade}**. {bias_txt}. "
+               f"Pojedynczy punkt różni się zwykle o ok. **{st_['mae']:.1f} mm** (średnio) i w 95% przypadków różnica mieści się "
+               f"między **{_f(st_['loa_lo'], 1, True)} a {_f(st_['loa_hi'], 1, True)} mm**. "
+               f"Różnica nie większa niż ±{tol:g} mm: **{st_['within_tol']:.0f}%** punktów "
+               f"(±3 mm: {st_['within_3']:.0f}%, ±5 mm: {st_['within_5']:.0f}%). "
+               f"Korelacja r = **{st_['pearson']:.2f}** ({corr_label(st_['pearson'])}) – " + shape_txt(st_['pearson']) +
+               f" (CCC {st_['ccc']:.2f}, ICC {st_['icc']:.2f} – to samo, ale z uwzględnieniem stałej różnicy).")
         items.append({"kind": kind, "title": f"Zgodność – {lab}", "text": txt})
+    if any(x and x.get("n", 0) >= 3 for x in (smax, sl, sr)):
+        items.append({"kind": "info", "title": "Jak czytać te liczby",
+                      "text": ("**Średnia różnica** – o ile LCMS jest średnio głębszy (+) lub płytszy (−) od RSP. "
+                               "**Zakres 95%** – w jakich granicach mieści się różnica dla 95% punktów (im węższy, tym lepiej). "
+                               "**Średnia różnica bezwzględna** – typowy rozmiar pojedynczej rozbieżności, bez względu na znak. "
+                               "**Korelacja r, CCC, ICC** – im bliżej 1, tym lepiej oba systemy zgadzają się co do kształtu przebiegu; "
+                               "r ocenia tylko podobieństwo wzorca, CCC i ICC dodatkowo karzą stałe przesunięcie wartości. "
+                               "Dla oceny praktycznej: każdy z systemów mierzy z niepewnością rzędu 1–2 mm, więc różnice pojedynczych punktów "
+                               "rzędu 2–3 mm są jeszcze zgodne z błędem pomiaru.")})
 
     # --- 4. Charakter rozbieżności
     st_ = smax if smax and smax.get("n", 0) >= 3 else (sl if sl else {})
@@ -2484,7 +2550,7 @@ def build_conclusions(ctx):
     base = smax if smax and smax.get("n", 0) >= 3 else sl
     if base and base.get("n", 0) >= 3:
         sig = not (base["bias_ci_lo"] <= 0 <= base["bias_ci_hi"])
-        if sig and abs(base["bias"]) >= 0.5:
+        if sig and abs(base["bias"]) >= 1.5:
             recs.append(f"skorygować/ocenić kalibrację – istnieje stały błąd systematyczny rzędu {base['bias']:+.1f} mm")
         if base["pearson"] < 0.7 and not sig:
             recs.append("niska korelacja przy braku biasu wskazuje na niedopasowanie przestrzenne (pikietaż, dryf, przesunięcie "
@@ -2552,7 +2618,7 @@ def fig_longitudinal(df, traces, title, view=None, selected=None, bands=True, ma
     x = d["Pikietaz"].values
     ymax = 10.0
     for t in traces:
-        if t["col"] not in d.columns:
+        if t["col"] not in d.columns or t.get("visible", True) is False:
             continue
         y = d[t["col"]].values.astype(float)
         if len(y) and not np.all(np.isnan(y)):
@@ -2568,7 +2634,7 @@ def fig_longitudinal(df, traces, title, view=None, selected=None, bands=True, ma
             ht = "%{x:.0f} m: %{y:.1f} mm<extra>" + t["name"] + "</extra>"
             extra = {}
         fig.add_trace(go.Scattergl(
-            x=xd, y=yd, mode="lines", name=t["name"], connectgaps=False,
+            x=xd, y=yd, mode="lines", name=t["name"], connectgaps=False, opacity=t.get("opacity", 1.0),
             line=dict(color=t.get("color", "gray"), width=t.get("width", 1.6), dash=t.get("dash", "solid")),
             hovertemplate=ht, **extra))
     if bands:
@@ -3382,7 +3448,7 @@ def get_conclusions(A):
         sync["n_sections"] = int(len(sdf))
     try:
         rL, rR, lL, lR, rc0, lc0 = make_pairs_src(A)
-        lag, c1, c2, lags, corr = cached_global_search(rL, rR, lL, lR, rc0, lc0, A["a0"], A["a1"], "Max", 101, 150)
+        lag, c1, c2, lags, corr = cached_global_search(rL, rR, lL, lR, rc0, lc0, A["a0"], A["a1"], "Max", 0, 400)
         cur = float(st.session_state.get("off_global", 0.0))
         k = int(np.argmin(np.abs(lags - round(cur))))
         sync.update({"auto_lag": lag, "auto_corr": c1, "cur_corr": float(corr[k]) if not np.isnan(corr[k]) else np.nan,
@@ -3443,8 +3509,9 @@ def tab_data(A):
             continue
         try:
             lo, hi = source_extent(e["src"], e["guess_start"], e["step_m"])
-            lo += e["start_m"] - native_chain(e["src"], e["guess_start"], e["step_m"])[0]
-            hi += e["start_m"] - native_chain(e["src"], e["guess_start"], e["step_m"])[0]
+            d_ = e["start_m"] - float(np.min(native_chain(e["src"], e["guess_start"], e["step_m"])))
+            lo += d_
+            hi += d_
             items.append((e["name"], e["type"], lo, hi))
         except Exception:  # noqa: BLE001
             continue
@@ -3506,8 +3573,8 @@ def tab_sync(A):
     rL, rR, lL, lR, rc0, lc0 = make_pairs_src(A)
     c1, c2, c3 = st.columns(3)
     metric = c1.selectbox("Seria do korelacji", ["Max", "L", "R", "L+R"], key="sy_metric")
-    hp = c2.number_input("Okno filtru górnoprzepustowego [m] (0 = brak)", 0, 1001, 101, 10, key="sy_hp")
-    msr = c3.number_input("Zakres szukania ± [m]", 10, 2000, 150, 10, key="sy_max")
+    hp = c2.number_input("Okno filtru górnoprzepustowego [m] (0 = brak)", 0, 1001, 0, 10, key="sy_hp0")
+    msr = c3.number_input("Zakres szukania ± [m]", 10, 3000, 400, 10, key="sy_max2")
     cur = float(st.session_state.get("off_global", 0.0))
     with st.container(border=True):
         st.markdown("**1. Offset globalny (korelacja krzyżowa)**")
@@ -3523,6 +3590,25 @@ def tab_sync(A):
         if not np.isnan(lag) and st.button(f"Zastosuj offset globalny {lag:+.0f} m", key="sy_apply_g"):
             set_pending(off_global=float(lag), off_ref=float(A["a0"]))
     with st.container(border=True):
+        st.markdown("**1b. Offset + dryf liniowy (maksimum korelacji surowych serii)**")
+        st.caption("Szuka stałego przesunięcia i dryfu skali drogomierzy (m/km) dających najwyższą korelację RSP–LCMS. "
+                   "To tylko 2 parametry, więc nie „dopasowuje szumu” jak dopasowanie segmentów.")
+        if st.button("Znajdź offset i dryf", key="sy_opt_btn"):
+            with st.spinner("Przeszukiwanie…"):
+                rm = np.fmax(rL, rR)
+                lm = np.fmax(lL, lR)
+                i0 = max(0, int(A["a0"] - rc0))
+                i1 = min(len(rm), int(A["a1"] - rc0) + 1)
+                ch_ = rc0 + np.arange(i0, i1)
+                st.session_state["opt_res"] = optimize_linear(ch_, rm[i0:i1], lm, lc0, A["a0"], off_center=float(lag) if not np.isnan(lag) else cur)
+        orr = st.session_state.get("opt_res")
+        if orr is not None and not np.isnan(orr[0]):
+            st.write(f"Najlepsze dopasowanie: offset **{orr[1]:+.1f} m** w {km_str(A['a0'])}, dryf **{orr[2]:+.2f} m/km** "
+                     f"(korelacja r = **{orr[0]:.3f}**).")
+            if st.button("Zastosuj offset i dryf", key="sy_opt_apply"):
+                st.session_state["sec_off_df"] = None
+                set_pending(off_global=float(orr[1]), off_drift=float(orr[2]), off_ref=float(A["a0"]))
+    with st.container(border=True):
         st.markdown("**2. Lokalne przesunięcia i dryf (okna przesuwne)**")
         w1, w2, w3 = st.columns(3)
         win = w1.number_input("Okno [m]", 300, 5000, 1000, 100, key="sy_win")
@@ -3531,7 +3617,7 @@ def tab_sync(A):
         if st.button("Policz mapę lokalnych przesunięć", key="sy_run_local"):
             with st.spinner("Liczenie okien…"):
                 st.session_state["lagmap"] = cached_lag_map(rL, rR, lL, lR, rc0, lc0, A["a0"], A["a1"], metric,
-                                                            int(hp), int(win), int(hop), int(max(msr, abs(cur) + loc_rng)))
+                                                            101, int(win), int(hop), int(max(msr, abs(cur) + loc_rng)))
         dfl = st.session_state.get("lagmap")
         if dfl is not None and len(dfl):
             fit = fit_drift(dfl, A["a0"])
@@ -3735,6 +3821,13 @@ def tab_long(A):
     span = c2.number_input("Szerokość widoku [m] (0 = cały odcinek)", 0.0, hi - lo, 0.0, 100.0, key="lg_span2")
     view = (v0, min(hi, v0 + span)) if span > 0 else (lo, hi)
     bands = st.checkbox("Pokaż klasy DSN (tło)", True, key="lg_bands")
+    v1, v2, v3, v4, v5 = st.columns(5)
+    show_r = v1.checkbox("Pokaż RSP", True, key="lg_show_r")
+    show_l = v2.checkbox("Pokaż LCMS", True, key="lg_show_l")
+    op_r = v3.slider("Przezroczystość RSP", 0.1, 1.0, 0.9, 0.05, key="lg_op_r")
+    op_l = v4.slider("Przezroczystość LCMS", 0.1, 1.0, 0.7, 0.05, key="lg_op_l")
+    lw = v5.slider("Grubość linii", 0.5, 4.0, 1.6, 0.1, key="lg_lw")
+    p_unaligned = p
     both = A["lcms_source"] == "both" and "LCMSc_L" in p.columns
     marks = []
     aligned = False
@@ -3786,10 +3879,17 @@ def tab_long(A):
         else:
             txt += " Bez dopasowania segmentów LCMS nie jest dodatkowo przesuwany. Wartość przesunięcia widać po najechaniu na krzywą LCMS."
         st.info(txt)
+    if aligned:
+        if st.checkbox("Pokaż dodatkowo wykres bez dopasowania (do porównania)", True, key="sg_both"):
+            tr0 = [{"col": "RSP_Max", "name": "RSP maksymalna", "color": C_RSP, "visible": show_r, "opacity": op_r, "width": lw},
+                   {"col": "LCMS_Max", "name": "LCMS maksymalna (bez dopasowania)", "color": C_LCMS, "hover_col": "Off",
+                    "visible": show_l, "opacity": op_l, "width": lw}]
+            plot(fig_longitudinal(p_unaligned, tr0, "Koleina maksymalna – BEZ dopasowania segmentów", view, bands=bands,
+                                  uirev="lg0"), "lg_unal")
     for key, lab in (("Max", "maksymalna"), ("L", "lewa"), ("R", "prawa")):
-        tr = [{"col": f"RSP_{key}", "name": f"RSP {lab}", "color": C_RSP},
+        tr = [{"col": f"RSP_{key}", "name": f"RSP {lab}", "color": C_RSP, "visible": show_r, "opacity": op_r, "width": lw},
               {"col": f"LCMS_{key}", "name": f"LCMS {lab}" + (" (dopasowany)" if aligned else ""),
-               "color": C_LCMS, "hover_col": "Off"}]
+               "color": C_LCMS, "hover_col": "Off", "visible": show_l, "opacity": op_l, "width": lw}]
         if both:
             tr.append({"col": f"LCMSc_{key}", "name": f"LCMS (łata) {lab}", "color": "#8fd18f", "dash": "dot"})
         plot(fig_longitudinal(p, tr, f"Koleina {lab} – RSP vs LCMS", view, bands=bands, uirev="lg" + key, extra_vlines=marks), "lg_" + key)
@@ -4007,6 +4107,31 @@ def file_registry_ui(refs):
             except Exception as exc:  # noqa: BLE001
                 cfg["note"] = f"błąd wczytania: {exc}"
                 cfg["use"] = False
+    # LCMS bez km w nazwie pliku: zakładamy start na pełnym km najbliższym początkowi RSP
+    rsp_lo = []
+    for r in refs:
+        cfg = reg[r.ident]
+        if cfg["typ"] in (TYPE_RSP_RAW, TYPE_RSP_KOLC) and cfg["use"] and cfg.get("start") is not None:
+            try:
+                src_ = cached_parse(r.ident, cfg["typ"], r)
+                rsp_lo.append(float(np.nanmin(native_chain(src_, 0.0, cfg["step"]))))
+            except Exception:  # noqa: BLE001
+                pass
+    if rsp_lo:
+        auto_km = float(np.round(min(rsp_lo) / 1000.0) * 1000.0)
+        for r in refs:
+            cfg = reg[r.ident]
+            if cfg["typ"] in (TYPE_LCMS_PROFILE, TYPE_LCMS_GPS) and not cfg.get("start_auto") and (cfg.get("start") in (None, 0.0)):
+                try:
+                    src_ = cached_parse(r.ident, cfg["typ"], r)
+                    if cfg["typ"] == TYPE_LCMS_PROFILE and guess_start_from_filename(src_["name"]) is None:
+                        cfg["start"] = auto_km
+                        cfg["start_auto"] = True
+                    elif cfg["typ"] == TYPE_LCMS_GPS:
+                        cfg["start"] = auto_km
+                        cfg["start_auto"] = True
+                except Exception:  # noqa: BLE001
+                    pass
     df = pd.DataFrame([{
         "Użyj": bool(reg[r.ident]["use"]), "Plik": r.name, "MB": float(fmt_mb(r.size)),
         "Typ": TYPE_LABELS.get(reg[r.ident]["typ"], reg[r.ident]["typ"]),
