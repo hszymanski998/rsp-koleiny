@@ -69,7 +69,7 @@ TYPE_LCMS_GPS = "LCMS_GPS"
 TYPE_SKIP = "SKIP"
 TYPE_LABELS = {
     TYPE_RSP_RAW: "RSP – surowe lasery",
-    TYPE_RSP_KOLC: "RSP – koleiny (KOLC / XML)",
+    TYPE_RSP_KOLC: "RSP – koleiny (KOLC XML / RTG)",
     TYPE_RSP_GPS: "RSP – GPS",
     TYPE_LCMS_PROFILE: "LCMS – profile",
     TYPE_LCMS_GPS: "LCMS – GPS (PIC XML)",
@@ -406,6 +406,8 @@ def classify_file(ref):
         low = txt.lower()
         if "<kolc" in low or "<odcinek>" in low:
             return TYPE_RSP_KOLC, ""
+        if "average rutting" in low and re.search(r"(?im)^\s*from\s*,\s*to\s*,\s*left", txt):
+            return TYPE_RSP_KOLC, "RTG (RspWin)"
         if "<picindex" in low:
             return TYPE_LCMS_GPS, ""
         if "<gpx" in low:
@@ -761,6 +763,45 @@ def parse_kolc(ref):
     }
 
 
+def parse_rtg(ref):
+    """RTG z RspWin: koleiny co 1 m (From, To [km], Left, Full, Right, LMax, FMax, RMax) – jak KOLC."""
+    txt = ref.read().decode("utf-8-sig", errors="replace")
+    lines = txt.splitlines()
+    head = lines[:14]
+    pat = re.compile(r"^\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*,\s*" + r"\s*,\s*".join([r"(-?[\d.]+)"] * 6) + r"\s*$")
+    rows = []
+    n_sum = 0
+    for ln in lines[12:]:
+        m = pat.match(ln)
+        if not m:
+            continue
+        v = [float(x) for x in m.groups()]
+        if abs(v[1] - v[0]) > 0.0015:  # wiersz podsumowania całego pliku
+            n_sum += 1
+            continue
+        rows.append(v)
+    if not rows:
+        raise ValueError("brak wierszy z koleinami w pliku RTG")
+    a = np.array(rows)
+    a[:, 2:][a[:, 2:] <= -90] = np.nan
+    chain = np.round(a[:, 0] * 1000.0, 3)
+    order = np.argsort(chain, kind="stable")
+    a, chain = a[order], chain[order]
+    notes = [f"RTG (RspWin): {len(a)} odcinków co 1 m, {chain[0] / 1000:.3f}–{chain[-1] / 1000 + 0.001:.3f} km"]
+    comments = []
+    for h in head[:3]:
+        mm = re.search(r"File:\s*(.+?)\s*$", h)
+        if mm:
+            notes.append("plik źródłowy RSP: " + mm.group(1).strip())
+    data = {"L": a[:, 2], "PEL": a[:, 3], "P": a[:, 4], "ML": a[:, 5], "MPEL": a[:, 6], "MP": a[:, 7]}
+    return {
+        "type": TYPE_RSP_KOLC, "name": ref.name, "ident": ref.ident,
+        "chain": chain, "chain_end": np.round(chain + 1.0, 3), "data": data,
+        "il_sat": np.full(len(a), np.nan), "pomiar": np.array([""] * len(a), dtype=object),
+        "dates": [], "gps": None, "attrs": {"FORMAT": "RTG"}, "comments": comments, "notes": notes, "n": int(len(a)),
+    }
+
+
 # ---------- 3.4 LCMS: profile poprzeczne ----------
 def _num_array(strings, dtype=np.float32):
     try:
@@ -989,6 +1030,9 @@ def parse_source(ref, typ):
     if typ == TYPE_RSP_RAW:
         return parse_rsp_raw(ref)
     if typ == TYPE_RSP_KOLC:
+        head = ref.head(4096).decode("utf-8-sig", errors="ignore").lower()
+        if "<kolc" not in head and "<odcinek" not in head and "average rutting" in head:
+            return parse_rtg(ref)
         return parse_kolc(ref)
     if typ == TYPE_RSP_GPS:
         return parse_rsp_gps(ref)
@@ -3037,10 +3081,8 @@ def cached_lcms_calc(uid, window, _L):
 
 
 @st.cache_resource(show_spinner=False, max_entries=6)
-def cached_rsp_raw_ruts(uid, _R):
-    raw = _R["raw"]
-    xs = raw.get("x_pos") or DEFAULT_RSP_X_LIST
-    return compute_rsp_ruts(raw["lasers"], xs)
+def cached_rsp_raw_ruts(uid, xs, _R):
+    return compute_rsp_ruts(_R["raw"]["lasers"], list(xs))
 
 
 @st.cache_data(show_spinner=False, max_entries=64)
@@ -3127,12 +3169,33 @@ def sys_desc(kind, A):
     return ""
 
 
-def get_rsp_xvals(R, n):
-    xs = (R["raw"].get("x_pos") if R and R.get("raw") is not None else None) or DEFAULT_RSP_X_LIST
-    xs = list(xs)
+def get_rsp_xvals(A, n):
+    xs = list(A.get("rsp_x") or DEFAULT_RSP_X_LIST)
     if len(xs) != n:
         xs = [round((i - (n - 1) / 2) * 0.165, 3) for i in range(n)]
     return np.array(xs, dtype=float)
+
+
+def rsp_geometry_ui(R):
+    """Pozycje X laserów RSP: z pliku / domyślne (edytowalne) albo stały odstęp – jak w poprzedniej wersji."""
+    n = R["raw"]["lasers"].shape[1] if R is not None and R.get("raw") is not None else 21
+    file_x = R["raw"].get("x_pos") if R is not None and R.get("raw") is not None else None
+    base = file_x if file_x and len(file_x) == n else DEFAULT_RSP_X_LIST
+    with st.sidebar.expander("Geometria laserów RSP"):
+        mode = st.radio("Typ konfiguracji czujników RSP:", ["Z pliku / domyślna RSP", "Stały odstęp (równomierny)"], key="rsp_geo")
+        if mode.startswith("Z pliku"):
+            txt = st.text_area("Pozycje X [m] dla laserów:", ", ".join(f"{x:.3f}" for x in base), height=90, key=f"rsp_x_txt_{n}_{int(file_x is not None)}")
+            try:
+                xs = [float(v.strip().replace(",", ".")) for v in txt.split(",") if v.strip()]
+            except Exception:  # noqa: BLE001
+                xs = list(base)
+        else:
+            step = st.number_input("Odstęp [m]:", 0.05, 0.50, 0.165, 0.005, format="%.3f", key="rsp_geo_step")
+            xs = [round((i - (n - 1) / 2) * step, 3) for i in range(n)]
+        if len(xs) != n:
+            st.warning(f"Podano {len(xs)} pozycji, a laserów jest {n} – użyto stałego odstępu 0.165 m.")
+            xs = [round((i - (n - 1) / 2) * 0.165, 3) for i in range(n)]
+    return xs
 
 
 def get_rsp_profile(A, c):
@@ -3542,7 +3605,7 @@ def tab_cross(A):
     x_vals = None
     if rp is not None:
         vals, k = rp
-        x_vals = get_rsp_xvals(A["rsp"], len(vals))
+        x_vals = get_rsp_xvals(A, len(vals))
         rs = rsp_cross_section(vals, x_vals, zero_l11)
     lp = get_lcms_profile(A, chain + off)
     label = (None, None)
@@ -3556,9 +3619,15 @@ def tab_cross(A):
             label = (None, None)
         if not bool(A["lcms"]["complete"][kk]):
             st.warning("Profil LCMS ma tylko jedną połówkę (lewą lub prawą) – wyniki częściowe.")
+    if rs is None and lc is not None and A["rsp"] is not None and A["rsp"].get("raw") is None:
+        st.info("Pokazany jest tylko przekrój LCMS – plik KOLC nie zawiera odczytów laserów RSP (tylko gotowe głębokości kolein).")
     if rs is None and lc is None:
-        st.warning("Brak profilu w tym pikietażu (RSP: brak surowych laserów lub luka; LCMS: brak profilu). "
-                   "Dla plików KOLC dostępne są tylko gotowe wartości koleiny (zakładka „Przebieg wzdłużny”).")
+        if A["rsp"] is not None and A["rsp"].get("raw") is None:
+            st.warning("Przekrój RSP nie jest dostępny: wczytano tylko plik KOLC, który zawiera gotowe głębokości kolein co 1 m "
+                       "(L_KOL, P_KOL, PEL_KOL), ale nie odczyty 21 laserów. Aby zobaczyć przekrój RSP, wgraj surowe pliki RSP "
+                       "(.RSP / xlsx / csv) – ich nazwy podaje nagłówek pliku KOLC.")
+        else:
+            st.warning("Brak profilu w tym pikietażu (RSP: luka w danych laserów; LCMS: brak profilu).")
     else:
         fig = fig_cross_section(rs, lc, f"Przekrój – RSP {km_str(chain)} / LCMS {km_str(chain + off)}", show_rh, show_lh, label,
                                 (min(-1.85, (x_vals.min() if x_vals is not None else -1.85)),
@@ -4010,11 +4079,13 @@ def main():
             with st.spinner("Liczenie kolein z profili LCMS (Wirtualna Łata)…"):
                 lcms_calc = cached_lcms_calc(lcms["uid"] + f"|{ss.get('win', 31)}", int(ss.get("win", 31)), lcms)
         lcms_s = lcms_series(lcms, lcms_calc)
+    rsp_x = None
     if rsp is not None:
         raw_ruts = None
         if rsp.get("raw") is not None:
+            rsp_x = rsp_geometry_ui(rsp)
             with st.spinner("Liczenie kolein RSP z laserów…"):
-                raw_ruts = cached_rsp_raw_ruts(rsp["uid"], rsp)
+                raw_ruts = cached_rsp_raw_ruts(rsp["uid"], tuple(rsp_x), rsp)
         rsp_s = rsp_series(rsp, raw_ruts, ss.get("kolc_param", "avg"))
 
     # domyślny zakres analizy
@@ -4062,7 +4133,7 @@ def main():
          "rdesc": rdesc, "ldesc": ldesc, "a0": a0, "a1": a1, "off_fn": off_fn, "off0": off0, "notes": notes,
          "tol": float(ss.get("tol", 2.0)), "sec_len": float(ss.get("sec_len", 50)), "min_cover": float(ss.get("min_cover", 0)),
          "rsp_source": ss.get("rsp_source", "auto"), "lcms_source": lcms_source, "swap_lr": bool(ss.get("swap_lr", False)),
-         "win": int(ss.get("win", 31)), "memo": {}}
+         "win": int(ss.get("win", 31)), "rsp_x": rsp_x, "memo": {}}
     st.session_state["sections_seen"] = True
     if len(valid) == 0:
         st.warning("Brak wspólnych punktów RSP–LCMS. Zwykle oznacza to złe pikietaże początkowe plików albo offset – "
