@@ -2633,7 +2633,7 @@ def fig_longitudinal(df, traces, title, view=None, selected=None, bands=True, ma
             xd, (yd,) = decimate_minmax(x, [y], max_points)
             ht = "%{x:.0f} m: %{y:.1f} mm<extra>" + t["name"] + "</extra>"
             extra = {}
-        fig.add_trace(go.Scattergl(
+        fig.add_trace(go.Scatter(
             x=xd, y=yd, mode="lines", name=t["name"], connectgaps=False, opacity=t.get("opacity", 1.0),
             line=dict(color=t.get("color", "gray"), width=t.get("width", 1.6), dash=t.get("dash", "solid")),
             hovertemplate=ht, **extra))
@@ -2662,10 +2662,10 @@ def fig_diff_along(df, a_col="RSP_Max", b_col="LCMS_Max", view=None, roll=101, t
     sm = nan_moving_average(diff, roll)
     fig = go.Figure()
     xd, (dd,) = decimate_minmax(x, [diff], max_points)
-    fig.add_trace(go.Scattergl(x=xd, y=dd, mode="lines", name="Δ (co 1 m)", line=dict(color="rgba(123,44,191,0.35)", width=1),
+    fig.add_trace(go.Scatter(x=xd, y=dd, mode="lines", name="Δ (co 1 m)", line=dict(color="rgba(123,44,191,0.35)", width=1),
                                hovertemplate="%{x:.0f} m: %{y:+.1f} mm<extra>Δ</extra>"))
     xs, (ss,) = decimate_minmax(x, [sm], max_points)
-    fig.add_trace(go.Scattergl(x=xs, y=ss, mode="lines", name=f"średnia krocząca {roll} m", line=dict(color=C_DIFF, width=2.5)))
+    fig.add_trace(go.Scatter(x=xs, y=ss, mode="lines", name=f"średnia krocząca {roll} m", line=dict(color=C_DIFF, width=2.5)))
     fig.add_hline(y=0, line_width=1, line_color="gray")
     fig.add_hrect(y0=-tol, y1=tol, fillcolor="green", opacity=0.07, line_width=0, layer="below")
     lo, hi = (view if view is not None else (float(x.min()) if len(x) else 0.0, float(x.max()) if len(x) else 1.0))
@@ -2688,7 +2688,7 @@ def build_bland_altman_fig(rsp_v, lcms_v, title="PRAWA KOLEINA", max_points=1500
     else:
         mx, my = means, diffs
     big = len(mx) > 3000
-    fig.add_trace(go.Scattergl(
+    fig.add_trace(go.Scatter(
         x=mx, y=my, mode="markers", name="Pomiary",
         marker=dict(size=4 if big else 7, color="#ffffcc" if not big else "rgba(70,70,70,0.35)",
                     line=dict(width=0 if big else 1, color="#333333")),
@@ -3379,8 +3379,14 @@ def stats_table(stx, tol):
 # ==========================================================================
 # 12. INTERFEJS – CZĘŚĆ B: zakładki
 # ==========================================================================
+PLOT_CONFIG = {"scrollZoom": False, "displaylogo": False, "responsive": True}
+
+
 def plot(fig, key):
-    wide(st.plotly_chart, fig, key=key)
+    try:
+        wide(st.plotly_chart, fig, key=key, config=PLOT_CONFIG)
+    except TypeError:
+        wide(st.plotly_chart, fig, key=key)
 
 
 def make_pairs_src(A):
@@ -3660,7 +3666,7 @@ def tab_sync(A):
             else:
                 med = float(np.median(go_["Offset [m]"]))
                 st.write(f"Mediana offsetu z GPS: **{med:+.1f} m** (n = {len(go_)}, mediana odległości śladów {np.median(go_['Dystans [m]']):.1f} m).")
-                f = go.Figure(go.Scattergl(x=go_["Pikietaz"], y=go_["Offset [m]"], mode="markers", marker=dict(size=4)))
+                f = go.Figure(go.Scatter(x=go_["Pikietaz"], y=go_["Offset [m]"], mode="markers", marker=dict(size=4)))
                 f.update_layout(height=300, xaxis_title="Pikietaż RSP [m]", yaxis_title="Offset z GPS [m]", template="plotly_white")
                 plot(f, "sy_gps")
                 if st.button(f"Zastosuj offset z GPS {med:+.0f} m", key="sy_apply_gps"):
@@ -4035,7 +4041,7 @@ def tab_map(A):
     if sep is not None and len(sep):
         st.write(f"Odległość śladów RSP i LCMS w tych samych (po przesunięciu) pikietażach: mediana **{sep['Dystans [m]'].median():.1f} m**, "
                  f"95. percentyl {sep['Dystans [m]'].quantile(0.95):.1f} m. Duże odległości sugerują błędny offset albo różne pasy ruchu.")
-        f = go.Figure(go.Scattergl(x=sep["Pikietaz"], y=sep["Dystans [m]"], mode="lines"))
+        f = go.Figure(go.Scatter(x=sep["Pikietaz"], y=sep["Dystans [m]"], mode="lines"))
         f.update_layout(height=280, xaxis_title="Pikietaż [m]", yaxis_title="Odległość śladów [m]", template="plotly_white")
         plot(f, "map_sep")
 
