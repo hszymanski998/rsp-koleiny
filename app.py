@@ -2557,11 +2557,20 @@ def fig_longitudinal(df, traces, title, view=None, selected=None, bands=True, ma
         y = d[t["col"]].values.astype(float)
         if len(y) and not np.all(np.isnan(y)):
             ymax = max(ymax, float(np.nanmax(y)))
-        xd, (yd,) = decimate_minmax(x, [y], max_points)
+        hc = t.get("hover_col")
+        if hc and hc in d.columns:
+            xd, (yd, cd) = decimate_minmax(x, [y, d[hc].values.astype(float)], max_points)
+            ht = ("%{x:.0f} m: %{y:.1f} mm<br>przesunięcie LCMS względem RSP: <b>%{customdata:+.1f} m</b>"
+                  "<extra>" + t["name"] + "</extra>")
+            extra = dict(customdata=cd)
+        else:
+            xd, (yd,) = decimate_minmax(x, [y], max_points)
+            ht = "%{x:.0f} m: %{y:.1f} mm<extra>" + t["name"] + "</extra>"
+            extra = {}
         fig.add_trace(go.Scattergl(
             x=xd, y=yd, mode="lines", name=t["name"], connectgaps=False,
             line=dict(color=t.get("color", "gray"), width=t.get("width", 1.6), dash=t.get("dash", "solid")),
-            hovertemplate="%{x:.0f} m: %{y:.1f} mm<extra>" + t["name"] + "</extra>"))
+            hovertemplate=ht, **extra))
     if bands:
         _class_bands(fig, ymax * 1.05)
     if selected is not None:
@@ -3701,6 +3710,14 @@ def apply_segment_shifts(p, seg_df, seg_len):
             seg[ok] = src[idx[ok]]
             out[i0:i1] = seg
         q["LCMS_" + col] = out
+    off_tot = p["Off"].values.astype(float).copy() if "Off" in p.columns else np.zeros(len(p))
+    extra = np.zeros(len(p))
+    for _, r in seg_df.iterrows():
+        i0 = max(0, int(r["Od [m]"] - c0))
+        i1 = min(len(ch), int(r["Od [m]"] + seg_len - c0))
+        extra[i0:i1] = float(int(round(r["Dodatkowe przesunięcie [m]"])))
+    q["Off"] = off_tot + extra
+    q["Off_seg"] = extra
     return q
 
 
@@ -3714,12 +3731,13 @@ def tab_long(A):
     p = A["pairs"]
     lo, hi = float(A["a0"]), float(A["a1"])
     c1, c2 = st.columns(2)
-    v0 = c1.number_input("Widok od [m]", lo, hi, lo, 100.0, key="lg_v0")
-    span = c2.number_input("Szerokość widoku [m] (0 = całość)", 0.0, hi - lo, min(2000.0, hi - lo), 100.0, key="lg_span")
+    v0 = c1.number_input("Widok od [m]", lo, hi, lo, 100.0, key="lg_v0b")
+    span = c2.number_input("Szerokość widoku [m] (0 = cały odcinek)", 0.0, hi - lo, 0.0, 100.0, key="lg_span2")
     view = (v0, min(hi, v0 + span)) if span > 0 else (lo, hi)
     bands = st.checkbox("Pokaż klasy DSN (tło)", True, key="lg_bands")
     both = A["lcms_source"] == "both" and "LCMSc_L" in p.columns
     marks = []
+    aligned = False
     with st.expander("Dopasowanie segmentów (lokalne przesunięcie LCMS na tym samym wykresie)"):
         st.caption("Trasa jest dzielona na segmenty; w każdym LCMS jest osobno przesuwany względem RSP (maksimum korelacji), "
                    "dzięki czemu na wykresie nie ma narastających przesunięć. Wartości możesz poprawić ręcznie.")
@@ -3744,6 +3762,7 @@ def tab_long(A):
             seg_df = ed
             if len(seg_df):
                 p = apply_segment_shifts(p, seg_df, int(seg_len))
+                aligned = True
                 marks = [(float(x), "") for x in seg_df["Od [m]"].values if view_overlaps(x, A, v0, span)]
                 st.write(f"Mediana r: przed **{np.nanmedian(seg_df['r przed']):.2f}**, po **{np.nanmedian(seg_df['r po']):.2f}**; "
                          f"przesunięcia od {seg_df['Dodatkowe przesunięcie [m]'].min():+.0f} do {seg_df['Dodatkowe przesunięcie [m]'].max():+.0f} m.")
@@ -3753,9 +3772,24 @@ def tab_long(A):
                     st.session_state["sec_off_df"] = pd.DataFrame({"Od [m]": seg_df["Od [m]"].values, "Offset [m]": tot})
                     st.session_state["sg_sig"] = None
                     set_pending(off_global=0.0, off_drift=0.0, off_ref=float(A["a0"]))
+    pv = p[(p["Pikietaz"] >= view[0]) & (p["Pikietaz"] <= view[1])]
+    if "Off" in pv.columns and len(pv):
+        o = pv["Off"].dropna()
+        sdf_ = section_edges_df()
+        has_sec = sdf_ is not None and len(sdf_) and bool(np.any(np.abs(sdf_["Offset [m]"].fillna(0).values) > 0))
+        txt = (f"Przesunięcie LCMS względem RSP w tym widoku: od **{o.min():+.1f}** do **{o.max():+.1f} m** "
+               f"(globalne {float(st.session_state.get('off_global', 0.0)):+.1f} m, dryf {float(st.session_state.get('off_drift', 0.0)):+.2f} m/km"
+               f"{', offsety sekcji aktywne' if has_sec else ''}).")
+        if aligned:
+            txt += (f" Dopasowanie segmentów dodaje {pv['Off_seg'].min():+.0f} … {pv['Off_seg'].max():+.0f} m "
+                    "– wartość widoczna po najechaniu na krzywą LCMS.")
+        else:
+            txt += " Bez dopasowania segmentów LCMS nie jest dodatkowo przesuwany. Wartość przesunięcia widać po najechaniu na krzywą LCMS."
+        st.info(txt)
     for key, lab in (("Max", "maksymalna"), ("L", "lewa"), ("R", "prawa")):
         tr = [{"col": f"RSP_{key}", "name": f"RSP {lab}", "color": C_RSP},
-              {"col": f"LCMS_{key}", "name": f"LCMS {lab}", "color": C_LCMS}]
+              {"col": f"LCMS_{key}", "name": f"LCMS {lab}" + (" (dopasowany)" if aligned else ""),
+               "color": C_LCMS, "hover_col": "Off"}]
         if both:
             tr.append({"col": f"LCMSc_{key}", "name": f"LCMS (łata) {lab}", "color": "#8fd18f", "dash": "dot"})
         plot(fig_longitudinal(p, tr, f"Koleina {lab} – RSP vs LCMS", view, bands=bands, uirev="lg" + key, extra_vlines=marks), "lg_" + key)
