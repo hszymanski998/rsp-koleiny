@@ -3667,6 +3667,16 @@ def tab_sync(A):
                     "W danych KOLC pole GPS bywa puste dla części trasy; wtedy GPS nie pomoże w synchronizacji tego odcinka.")
         else:
             go_ = gps_nearest_offsets(rg, lg, 10.0, (A["a0"], A["a1"]))
+            ca, cb, cc = st.columns(3)
+            ant_r = ca.number_input("Antena GPS RSP względem belki [m]", -15.0, 15.0, 0.0, 0.5, key="ant_rsp",
+                                    help="Dodatnia: antena jest przed belką/laserami (w kierunku jazdy), ujemna: za nimi.")
+            ant_l = cb.number_input("Antena GPS LCMS względem belki [m]", -15.0, 15.0, 0.0, 0.5, key="ant_lcms")
+            dirn = cc.radio("Kierunek jazdy", ["rosnący", "malejący"], horizontal=True, key="ant_dir")
+            if go_ is not None and len(go_) and (ant_r != 0.0 or ant_l != 0.0):
+                sgn = 1.0 if dirn == "rosnący" else -1.0
+                go_ = go_.copy()
+                go_["Offset [m]"] = go_["Offset [m]"] - sgn * (ant_r - ant_l)
+                st.caption(f"Offset z GPS skorygowany o odsunięcie anten: {-sgn * (ant_r - ant_l):+.1f} m.")
             if go_ is None or len(go_) == 0:
                 st.warning("Ślady GPS RSP i LCMS nie zbliżają się do siebie w zakresie analizy (lub ślad RSP nie pokrywa zakresu).")
             else:
