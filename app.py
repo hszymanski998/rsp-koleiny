@@ -2641,8 +2641,14 @@ def fig_longitudinal(df, traces, title, view=None, selected=None, bands=True, ma
         _class_bands(fig, ymax * 1.05)
     if selected is not None:
         fig.add_vline(x=selected, line_width=2, line_color="red", annotation_text=km_str(selected))
-    for xv, lab in (extra_vlines or []):
-        fig.add_vline(x=xv, line_width=1, line_dash="dot", line_color="gray", annotation_text=lab)
+    if extra_vlines:
+        try:
+            shp = list(fig.layout.shapes or ())
+        except TypeError:
+            shp = []
+        shp += [dict(type="line", xref="x", yref="paper", x0=float(xv), x1=float(xv), y0=0, y1=1,
+                     line=dict(width=1, dash="dot", color="gray")) for xv, _lab in extra_vlines]
+        fig.update_layout(shapes=shp)
     lo, hi = (view if view is not None else (float(x.min()) if len(x) else 0.0, float(x.max()) if len(x) else 1.0))
     fig.update_layout(title=title, xaxis_title="Pikietaż (km+m)", yaxis_title=ytitle, height=height,
                       hovermode="x unified", margin=dict(l=50, r=20, t=50, b=40),
@@ -3848,6 +3854,7 @@ def tab_long(A):
         hp_ = g4.number_input("Filtr górnoprzepustowy [m]", 0, 1001, 101, 10, key="sg_hp")
         mc_ = g5.number_input("Min. korelacja", 0.0, 1.0, 0.2, 0.05, key="sg_minc")
         if on:
+          try:
             sig = (int(seg_len), int(max_lag), col_, int(hp_), float(mc_), float(A["a0"]), float(A["a1"]),
                    round(float(st.session_state.get("off_global", 0.0)), 3), round(float(st.session_state.get("off_drift", 0.0)), 4))
             if st.session_state.get("sg_sig") != sig:
@@ -3871,6 +3878,13 @@ def tab_long(A):
                     st.session_state["sec_off_df"] = pd.DataFrame({"Od [m]": seg_df["Od [m]"].values, "Offset [m]": tot})
                     st.session_state["sg_sig"] = None
                     set_pending(off_global=0.0, off_drift=0.0, off_ref=float(A["a0"]))
+          except RuntimeError:
+            raise
+          except Exception as exc:  # noqa: BLE001
+            import traceback as _tb
+            st.error(f"Dopasowanie segmentów nie powiodło się: {exc}")
+            st.code(_tb.format_exc())
+            p, aligned, marks = p_unaligned, False, []
     pv = p[(p["Pikietaz"] >= view[0]) & (p["Pikietaz"] <= view[1])]
     if "Off" in pv.columns and len(pv):
         o = pv["Off"].dropna()
