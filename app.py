@@ -3637,10 +3637,13 @@ def get_conclusions(A):
         _, cs_pt = class_confusion(v["RSP_Max"].values, v["LCMS_Max"].values)
     if len(hm) >= 3:
         _, cs_sec = class_confusion(hm["RSP MAX_KOL Hm"].values, hm["LCMS MAX_KOL Hm"].values)
+    so = A.get("sync_override")
     sync = {"offset": float(st.session_state.get("off_global", 0.0)), "drift": float(st.session_state.get("off_drift", 0.0)),
             "n_sections": 0}
     sdf = section_edges_df()
-    if sdf is not None and len(sdf) and np.any(np.abs(sdf["Offset [m]"].fillna(0).values) > 0):
+    if so is not None:
+        sync.update({"offset": float(so[0]), "drift": float(so[1])})
+    elif sdf is not None and len(sdf) and np.any(np.abs(sdf["Offset [m]"].fillna(0).values) > 0):
         sync["n_sections"] = int(len(sdf))
     try:
         rL, rR, lL, lR, rc0, lc0 = make_pairs_src(A)
@@ -3664,7 +3667,115 @@ def get_conclusions(A):
            "sections": sec, "quality_notes": A["notes"], "rpd_high_share": rpd_share}
     memo["concl"] = build_conclusions(ctx)
     memo["sec_1km"] = sec
+    memo["raw"] = {"stats": stx, "cs_pt": cs_pt, "cs_sec": cs_sec, "sec": sec, "rpd": rpd_share, "cover": ctx["cover"], "sync": sync}
     return memo["concl"]
+
+
+def _fmt(x, nd=2, sign=False):
+    try:
+        if x is None or np.isnan(x):
+            return "–"
+        return (f"{x:+.{nd}f}" if sign else f"{x:.{nd}f}").replace(".", ",")
+    except Exception:  # noqa: BLE001
+        return "–"
+
+
+def _arrow(a, b, nd=2, unit="", sign=False):
+    return f"{_fmt(a, nd, sign)}{unit} → **{_fmt(b, nd, sign)}{unit}**"
+
+
+def build_alt_context(A):
+    """Wariant porównawczy: jeśli przesunięcie jest 0 – wariant „po dopasowaniu pikietażu”, w przeciwnym razie „bez przesunięcia”."""
+    ss = st.session_state
+    cur_off, cur_dr = float(ss.get("off_global", 0.0)), float(ss.get("off_drift", 0.0))
+    sdf = section_edges_df()
+    has_sec = sdf is not None and len(sdf) and bool(np.any(np.abs(sdf["Offset [m]"].fillna(0).values) > 0))
+    cur_zero = abs(cur_off) < 0.5 and abs(cur_dr) < 0.05 and not has_sec
+    a0, a1 = A["a0"], A["a1"]
+    if cur_zero:
+        sig = ("alt", A["rsp"]["uid"], A["lcms"]["uid"], a0, a1, A["rsp_source"], A["lcms_source"], A["swap_lr"])
+        if ss.get("alt_sig") != sig:
+            rL, rR, lL, lR, rc0, lc0 = make_pairs_src(A)
+            lag, c1, c2, lags, corr = cached_global_search(rL, rR, lL, lR, rc0, lc0, a0, a1, "Max", 0, 100)
+            rm, lm = np.fmax(rL, rR), np.fmax(lL, lR)
+            i0 = max(0, int(a0 - rc0))
+            i1 = min(len(rm), int(a1 - rc0) + 1)
+            ch_ = rc0 + np.arange(i0, i1)
+            res = optimize_linear(ch_, rm[i0:i1], lm, lc0, a0, off_center=float(lag) if not np.isnan(lag) else 0.0)
+            ss["alt_sig"], ss["alt_res"] = sig, res
+        res = ss.get("alt_res")
+        if res is None or np.isnan(res[0]):
+            return None
+        off, dr = float(res[1]), float(res[2])
+        label_cur = "bez przesunięcia pikietażu (ustawienia bieżące)"
+        label_alt = f"po dopasowaniu pikietażu (offset {off:+.1f} m, dryf {dr:+.2f} m/km)"
+        apply_ = (off, dr)
+    else:
+        apply_ = (0.0, 0.0)
+        label_cur = "z bieżącym przesunięciem pikietażu"
+        label_alt = "bez przesunięcia pikietażu (offset 0, dryf 0)"
+    off_fn = lambda c: make_offsets(c, apply_[0], apply_[1], ref=a0)
+    pairs, _ = build_pairs(A["rsp_s"], A["lcms_s"], A["rsp_source"], A["lcms_source"], a0, a1, off_fn,
+                           ss.get("kolc_param", "avg"), bool(A["swap_lr"]))
+    valid = pairs.dropna(subset=["RSP_L", "RSP_R", "LCMS_L", "LCMS_R"]).reset_index(drop=True)
+    if len(valid) < 3:
+        return None
+    A2 = dict(A, pairs=pairs, valid=valid, off_fn=off_fn, memo={}, sync_override=apply_)
+    return {"A": A2, "label_cur": label_cur, "label_alt": label_alt}
+
+
+def alt_line(title, cur, alt):
+    """Jednozdaniowy opis zmiany dla danej pozycji wniosków (cur, alt – słowniki „raw”)."""
+    sc, sa = cur["stats"], alt["stats"]
+    for key, nm in (("Max", "koleina maksymalna"), ("L", "lewa"), ("R", "prawa")):
+        if title.startswith("Zgodność –") and nm.split()[0] in title.lower().replace("koleina", "koleina"):
+            a, b = sc.get(key, {}), sa.get(key, {})
+            if not a or not b:
+                return None
+            return (f"korelacja r {_arrow(a['pearson'], b['pearson'], 2)}; rozrzut różnic (SD) {_arrow(a['sd'], b['sd'], 2, ' mm')}; "
+                    f"średnia różnica (bias) {_arrow(a['bias'], b['bias'], 2, ' mm', True)}; "
+                    f"punktów w ±2 mm {_arrow(a['within_tol'], b['within_tol'], 0, '%')}; "
+                    f"zakres 95% różnic od {_fmt(a['loa_lo'], 1, True)}…{_fmt(a['loa_hi'], 1, True)} do **{_fmt(b['loa_lo'], 1, True)}…{_fmt(b['loa_hi'], 1, True)} mm**.")
+    if title.startswith("Klasy DSN"):
+        k = "cs_pt" if "co 1 m" in title else "cs_sec"
+        a, b = cur.get(k), alt.get(k)
+        if not a or not b or not a.get("n") or not b.get("n"):
+            return None
+        return (f"klasy identyczne {_arrow(a['exact'], b['exact'], 0, '%')}; w ±1 klasy {_arrow(a['within1'], b['within1'], 0, '%')}; "
+                f"kappa ważona {_arrow(a['kappa_w'], b['kappa_w'], 2)}; LCMS gorsza klasa {_arrow(a['lcms_higher'], b['lcms_higher'], 0, '%')}, "
+                f"lepsza {_arrow(a['lcms_lower'], b['lcms_lower'], 0, '%')}.")
+    if title == "Dane i pokrycie":
+        a, b = cur["cover"], alt["cover"]
+        return f"liczba porównanych punktów {a['n_valid']:,} → **{b['n_valid']:,}**; pokrycie {a['pct']:.0f}% → **{b['pct']:.0f}%**.".replace(",", " ")
+    if title == "Synchronizacja pikietażu":
+        sy = alt["sync"]
+        a, b = sc.get("Max", {}), sa.get("Max", {})
+        return (f"przesunięcie {_fmt(cur['sync']['offset'], 1, True)} m, dryf {_fmt(cur['sync']['drift'], 2, True)} m/km → "
+                f"**{_fmt(sy['offset'], 1, True)} m, {_fmt(sy['drift'], 2, True)} m/km**; korelacja r (Max) {_arrow(a.get('pearson'), b.get('pearson'), 2)}.")
+    if title.startswith("Charakter rozbieżności"):
+        a, b = sc.get("Max", {}), sa.get("Max", {})
+        return (f"SD(LCMS)/SD(RSP) {_arrow(a.get('sd_ratio'), b.get('sd_ratio'), 2)}; nachylenie regresji MNK {_arrow(a.get('slope'), b.get('slope'), 2)}, "
+                f"ortogonalne {_arrow(a.get('deming_slope'), b.get('deming_slope'), 2)}. Rozjechany pikietaż spłaszcza regresję i zawyża rozrzut.")
+    if title.startswith("RPD"):
+        return f"udział punktów z RPD > 30% {_arrow(cur.get('rpd'), alt.get('rpd'), 0, '%')}."
+    if title == "Odcinki do weryfikacji":
+        def lo(sec):
+            try:
+                if "n" in sec.columns:
+                    sec = sec[sec["n"] >= 200]
+                return float(sec["r"].min())
+            except Exception:  # noqa: BLE001
+                return np.nan
+        def bmax(sec):
+            try:
+                if "n" in sec.columns:
+                    sec = sec[sec["n"] >= 200]
+                return float(sec["Bias [mm]"].abs().max())
+            except Exception:  # noqa: BLE001
+                return np.nan
+        return (f"najniższa korelacja na kilometrze {_arrow(lo(cur['sec']), lo(alt['sec']), 2)}; największy |bias| na kilometrze "
+                f"{_arrow(bmax(cur['sec']), bmax(alt['sec']), 1, ' mm')}.")
+    return None
 
 
 def tab_conclusions(A):
@@ -3684,10 +3795,31 @@ def tab_conclusions(A):
     cols[1].metric("Bias LCMS − RSP [mm]", nice_number(s.get("bias"), 2))
     cols[2].metric("Korelacja r (Max)", nice_number(s.get("pearson"), 2))
     cols[3].metric(f"W ±{A['tol']:g} mm", f"{nice_number(s.get('within_tol'), 0)}%")
+    alt = None
+    try:
+        with st.spinner("Porównanie z wariantem przesunięcia pikietażu…"):
+            alt = build_alt_context(A)
+            if alt is not None:
+                ca = get_conclusions(alt["A"])
+                raw_c, raw_a = A["memo"]["raw"], alt["A"]["memo"]["raw"]
+    except Exception:  # noqa: BLE001
+        alt = None
+    if alt is not None:
+        st.info(f"Pod każdym wnioskiem podano, jak zmienia się wynik: **{alt['label_cur']}** → **{alt['label_alt']}**. "
+                "Przesunięcie pikietażu zmienia głównie zgodność punktową (korelację, rozrzut, klasy co 1 m); średni poziom (bias) zwykle prawie się nie zmienia.")
     for it in c["items"]:
         ic = {"ok": "🟢", "info": "🔵", "warn": "🟡", "bad": "🔴"}.get(it["kind"], "🔵")
         with st.container(border=True):
             st.markdown(f"**{ic} {it['title']}**\n\n{it['text']}")
+            if alt is not None:
+                try:
+                    ln = alt_line(it["title"], raw_c, raw_a)
+                    if it["title"] == "Podsumowanie i rekomendacje":
+                        ln = f"ogólna ocena zgodności: {c['grade']} → **{ca['grade']}**."
+                    if ln:
+                        st.markdown(f"↪️ **{alt['label_alt'][0].upper() + alt['label_alt'][1:]}:** " + ln)
+                except Exception:  # noqa: BLE001
+                    pass
     fig, *_ = build_bland_altman_fig(v["RSP_Max"].values, v["LCMS_Max"].values, "KOLEINA MAKSYMALNA")
     plot(fig, "ov_ba")
     plot(fig_longitudinal(A["pairs"], [
