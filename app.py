@@ -46,11 +46,11 @@ APP_VERSION = "2.0"
 # ==========================================================================
 # 1. STAŁE I NARZĘDZIA
 # ==========================================================================
-# Dokładna geometria laserów RSP [m] (-1.610 m do +1.618 m) – bez zmian
+# Geometria laserów RSP [m] (-1,695 m do +1,700 m) – taka jak zapisana w plikach .RSP
 DEFAULT_RSP_X_LIST = [
-    -1.610, -1.444, -1.285, -1.145, -1.007, -0.850, -0.700, -0.550, -0.400,
-    -0.200, 0.000, 0.200, 0.400, 0.550, 0.700, 0.850, 1.003, 1.140, 1.280,
-    1.440, 1.618,
+    -1.695, -1.510, -1.320, -1.160, -1.007, -0.850, -0.700, -0.550, -0.400,
+    -0.200, 0.000, 0.200, 0.400, 0.550, 0.700, 0.850, 1.003, 1.158, 1.318,
+    1.510, 1.700,
 ]
 DEFAULT_RSP_X_STR = ", ".join(f"{x:.3f}" for x in DEFAULT_RSP_X_LIST)
 
@@ -1232,10 +1232,16 @@ def lcms_cross_section(x_orig, z_raw, rsp_x_min, rsp_x_max, window=31,
     rl_calc, rr_calc = rut_pair_from_profile(x_orig, z_raw, window)
 
     x = x_orig.copy()
+    mode = zaczep_prawa if isinstance(zaczep_prawa, str) else ("right" if zaczep_prawa else "none")
     if skaluj_szerokosc and len(x) > 1 and (x.max() - x.min()) > 0:
         x = rsp_x_min + (x - x.min()) * ((rsp_x_max - rsp_x_min) / (x.max() - x.min()))
-    elif zaczep_prawa and len(x) > 0:
+    elif len(x) > 0 and mode == "right":
         x = x + (rsp_x_max - np.max(x))
+    elif len(x) > 0 and mode == "left":
+        x = x + (rsp_x_min - np.min(x))
+    elif len(x) > 0 and mode == "center":
+        x = x + ((rsp_x_min + rsp_x_max) / 2.0 - (np.min(x) + np.max(x)) / 2.0)
+    shift_applied = float(np.mean(x - x_orig)) if len(x) else 0.0
     x = x + manual_shift
 
     mid = (x >= -0.5) & (x <= 0.5)
@@ -1270,7 +1276,7 @@ def lcms_cross_section(x_orig, z_raw, rsp_x_min, rsp_x_max, window=31,
     i_r_rel = int(np.argmax(d_r)) if len(d_r) else 0
     i_r = ic + i_r_rel
     return {
-        "x": x, "z_plot": z_plot, "idx_crown": ic, "x_l": x_l, "x_r": x_r,
+        "x": x, "z_plot": z_plot, "idx_crown": ic, "x_l": x_l, "x_r": x_r, "shift": shift_applied + float(manual_shift),
         "lata_l": lata_l0, "lata_r": lata_r0,
         "rut_l_calc": rl_calc, "rut_r_calc": rr_calc,
         "i_l": i_l, "i_r": i_r, "i_r_rel": i_r_rel,
@@ -1290,6 +1296,33 @@ def level_profile_for_map(x, z, x_grid, window=31):
         zs = zs - p[0] * x
     zs = zs - zs[int(np.argmin(np.abs(x)))]
     return np.interp(x_grid, x, zs, left=np.nan, right=np.nan)
+
+
+def auto_lateral_shift(x_l, z_l, x_r, h_r, max_shift=0.6, step=0.02):
+    """Przesunięcie poprzeczne LCMS [m], przy którym kształt profilu LCMS najlepiej zgadza się z profilem RSP
+    (korelacja po usunięciu spadku poprzecznego). Zwraca (przesunięcie, korelacja)."""
+    x_l = np.asarray(x_l, dtype=float)
+    z_l = np.asarray(z_l, dtype=float)
+    x_r = np.asarray(x_r, dtype=float)
+    h_r = np.asarray(h_r, dtype=float)
+    ok = ~np.isnan(z_l)
+    x_l, z_l = x_l[ok], z_l[ok]
+    if len(x_l) < 20 or len(x_r) < 10:
+        return 0.0, float("nan")
+    best = (0.0, -2.0)
+    for s_ in np.arange(-max_shift, max_shift + 1e-9, step):
+        zz = np.interp(x_r - s_, x_l, z_l, left=np.nan, right=np.nan)
+        m = ~np.isnan(zz) & ~np.isnan(h_r)
+        if m.sum() < 15:
+            continue
+        a = zz[m] - np.polyval(np.polyfit(x_r[m], zz[m], 1), x_r[m])
+        b = h_r[m] - np.polyval(np.polyfit(x_r[m], h_r[m], 1), x_r[m])
+        if np.std(a) < 1e-9 or np.std(b) < 1e-9:
+            continue
+        c = float(np.corrcoef(a, b)[0, 1])
+        if c > best[1]:
+            best = (float(s_), c)
+    return (best[0], best[1]) if best[1] > -2 else (0.0, float("nan"))
 
 
 # ==========================================================================
@@ -2694,7 +2727,7 @@ def build_bland_altman_fig(rsp_v, lcms_v, title="PRAWA KOLEINA", max_points=1500
     else:
         mx, my = means, diffs
     big = len(mx) > 3000
-    fig.add_trace(go.Scatter(
+    fig.add_trace(go.Scattergl(
         x=mx, y=my, mode="markers", name="Pomiary",
         marker=dict(size=4 if big else 7, color="#ffffcc" if not big else "rgba(70,70,70,0.35)",
                     line=dict(width=0 if big else 1, color="#333333")),
@@ -2956,7 +2989,8 @@ def fig_hist_depths(rsp_v, lcms_v, title="Rozkład głębokości kolein"):
 
 # ---------- przekrój poprzeczny (jak dotychczas) ----------
 def fig_cross_section(rs, lc, title, show_rsp_hull=True, show_lcms_hull=True, label_lcms=None,
-                      x_range=(-1.85, 1.85), profile_name="LCMS"):
+                      x_range=(-1.85, 1.85), profile_name="LCMS", op_rsp=1.0, op_lcms=0.8,
+                      show_rsp_profile=True, show_lcms_profile=True):
     """Przekrój poprzeczny RSP + LCMS. rs / lc – wyniki rsp_cross_section / lcms_cross_section (lub None)."""
     fig = go.Figure()
     y_label = "Wysokość względna [mm]"
@@ -3010,6 +3044,19 @@ def fig_cross_section(rs, lc, title, show_rsp_hull=True, show_lcms_hull=True, la
             fig.add_annotation(x=lc["x_kp"], y=(lc["y_r_lata"] + lc["y_r_prof"]) / 2, text=f"<b>LCMS: {vr:.1f} mm</b> ",
                                showarrow=False, font=dict(color="forestgreen", size=12), bgcolor="rgba(235, 255, 235, 0.95)",
                                bordercolor="forestgreen", borderwidth=1, xanchor="left")
+    try:
+        for tr in fig.data:
+            nm = str(tr.name or "")
+            if "RSP" in nm:
+                tr.opacity = op_rsp
+                if nm.startswith("Profil RSP") and not show_rsp_profile:
+                    tr.visible = False
+            elif "LCMS" in nm or nm == profile_name:
+                tr.opacity = op_lcms
+                if nm == profile_name and not show_lcms_profile:
+                    tr.visible = False
+    except (TypeError, AttributeError):
+        pass
     fig.add_vline(x=0, line_width=1, line_dash="dot", line_color="gray", annotation_text="Oś L11 (0.0 m)")
     fig.update_layout(title=title, xaxis_title="Pozycja czujnika na belce [m]", yaxis_title=y_label, height=580,
                       hovermode="x unified", xaxis=dict(range=list(x_range), dtick=0.2),
@@ -3263,9 +3310,14 @@ def rsp_geometry_ui(R):
     file_x = R["raw"].get("x_pos") if R is not None and R.get("raw") is not None else None
     base = file_x if file_x and len(file_x) == n else DEFAULT_RSP_X_LIST
     with st.sidebar.expander("Geometria laserów RSP"):
-        mode = st.radio("Typ konfiguracji czujników RSP:", ["Z pliku / domyślna RSP", "Stały odstęp (równomierny)"], key="rsp_geo")
+        mode = st.radio("Typ konfiguracji czujników RSP:", ["Z pliku / domyślna RSP", "Stały odstęp (równomierny)"], key="rsp_geo",
+                        help="„Z pliku”: pozycje laserów odczytane z nagłówka pliku RSP (lub domyślne -1,695 … +1,700 m). "
+                             "Zmieniaj tylko wtedy, gdy belka ma inny rozstaw laserów.")
         if mode.startswith("Z pliku"):
-            txt = st.text_area("Pozycje X [m] dla laserów:", ", ".join(f"{x:.3f}" for x in base), height=90, key=f"rsp_x_txt_{n}_{int(file_x is not None)}")
+            st.caption(("Pozycje odczytane z pliku RSP." if file_x else "Pozycje domyślne (plik nie zawiera geometrii laserów).")
+                       + f" Zakres: {min(base):+.3f} … {max(base):+.3f} m.")
+            sig_ = abs(hash(tuple(round(float(x), 3) for x in base))) % 10 ** 8
+            txt = st.text_area("Pozycje X [m] dla laserów:", ", ".join(f"{x:.3f}" for x in base), height=90, key=f"rsp_x_txt_{n}_{sig_}")
             try:
                 xs = [float(v.strip().replace(",", ".")) for v in txt.split(",") if v.strip()]
             except Exception:  # noqa: BLE001
@@ -3694,28 +3746,67 @@ def _xs_step(d):
     st.session_state["xs_chain"] = float(st.session_state.get("xs_chain", 0.0)) + d
 
 
+def _xs_from_slider():
+    st.session_state["xs_chain"] = float(st.session_state.get("xs_sl", st.session_state.get("xs_chain", 0.0)))
+
+
 def tab_cross(A):
     st.subheader("Przekrój poprzeczny (profil)")
     p = A["pairs"]
     lo, hi = float(A["a0"]), float(A["a1"])
     if "xs_chain" not in st.session_state or not (lo <= st.session_state["xs_chain"] <= hi):
         st.session_state["xs_chain"] = float(np.floor((lo + hi) / 2))
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 3])
+    st.session_state["xs_sl"] = int(st.session_state["xs_chain"])
+    st.slider("Pikietaż na całym odcinku [m]", int(lo), int(hi), key="xs_sl", on_change=_xs_from_slider,
+              help="Przesuń suwak, aby obejrzeć profil w dowolnym miejscu odcinka. Dokładny pikietaż możesz też wpisać niżej "
+                   "lub przesuwać przyciskami o 1, 10 lub 100 m.")
+    c0, c1, c2, c3, c3b, c3c, c4 = st.columns([1, 1, 1, 1, 1, 1, 3])
+    c0.button("◀◀ −100", on_click=_xs_step, args=(-100.0,), key="xs_m100")
     c1.button("◀ −10 m", on_click=_xs_step, args=(-10.0,), key="xs_m10")
     c2.button("◀ −1 m", on_click=_xs_step, args=(-1.0,), key="xs_m1")
     c3.button("+1 m ▶", on_click=_xs_step, args=(1.0,), key="xs_p1")
+    c3b.button("+10 m ▶", on_click=_xs_step, args=(10.0,), key="xs_p10")
+    c3c.button("+100 ▶▶", on_click=_xs_step, args=(100.0,), key="xs_p100")
     chain = c4.number_input("Pikietaż RSP [m]", min_value=lo, max_value=hi, step=1.0, key="xs_chain")
     chain = float(np.round(chain))
+    with st.expander("Skocz do charakterystycznego miejsca"):
+        jump = st.selectbox("Miejsce", ["największa koleina RSP", "największa koleina LCMS", "największa różnica LCMS − RSP"],
+                            key="xs_jump_kind")
+        if st.button("Skocz", key="xs_jump_go"):
+            pp = p[(p["Pikietaz"] >= lo) & (p["Pikietaz"] <= hi)]
+            if jump.startswith("największa koleina RSP"):
+                col_ = pp["RSP_Max"]
+            elif jump.startswith("największa koleina LCMS"):
+                col_ = pp["LCMS_Max"]
+            else:
+                col_ = (pp["LCMS_Max"] - pp["RSP_Max"]).abs()
+            if col_.notna().any():
+                set_pending(xs_chain=float(pp.loc[col_.idxmax(), "Pikietaz"]))
     st.caption(f"Pikietaż RSP: **{km_str(chain)}**; pikietaż LCMS = {km_str(chain + float(A['off_fn'](np.array([chain]))[0]))}")
     o1, o2, o3, o4 = st.columns(4)
     zero_l11 = o1.checkbox("Zeruj do L11", True, key="xs_zero")
     show_rh = o2.checkbox("Łata RSP", True, key="xs_rh")
     show_lh = o3.checkbox("Łata LCMS", True, key="xs_lh")
-    manual = o4.number_input("Przesunięcie poprzeczne LCMS [m]", -1.0, 1.0, 0.0, 0.01, key="xs_shift")
-    p1, p2, p3 = st.columns(3)
-    skal = p1.checkbox("Skaluj szerokość LCMS do RSP", False, key="xs_scale")
-    zacz = p2.checkbox("Zaczep prawej krawędzi", True, key="xs_hook")
-    wyr = p3.checkbox("Wyrównaj spadek poprzeczny", True, key="xs_level")
+    manual = o4.number_input("Dodatkowe przesunięcie poprzeczne LCMS [m]", -1.0, 1.0, 0.0, 0.01, key="xs_shift")
+    v1, v2, v3, v4 = st.columns(4)
+    show_rp = v1.checkbox("Pokaż profil RSP", True, key="xs_show_rp")
+    show_lp = v2.checkbox("Pokaż profil LCMS", True, key="xs_show_lp")
+    op_rsp = v3.slider("Przezroczystość RSP", 0.1, 1.0, 1.0, 0.05, key="xs_op_r")
+    op_lcms = v4.slider("Przezroczystość LCMS", 0.1, 1.0, 0.7, 0.05, key="xs_op_l")
+    p1, p2, p3 = st.columns([2, 1, 1])
+    align = p1.radio(
+        "Dopasowanie poprzeczne profilu LCMS do RSP", ["right", "left", "center", "auto", "none"], horizontal=True, key="xs_align",
+        format_func=lambda k: {"right": "prawa krawędź", "left": "lewa krawędź", "center": "środek", "auto": "automatyczne (kształt)",
+                               "none": "bez dopasowania"}[k],
+        help="Jak ustawić profil LCMS względem profilu RSP w poziomie. Prawa/lewa krawędź: skrajny punkt profilu LCMS jest "
+             "ustawiany na skrajnym laserze RSP. Środek: środek szerokości LCMS na środku belki RSP. Automatyczne: "
+             "przesunięcie dobierane tak, aby kształt profilu najlepiej pasował do RSP. Bez dopasowania: współrzędne "
+             "z pliku LCMS. Wartość zastosowanego przesunięcia jest podana pod wykresem.")
+    skal = p2.checkbox("Skaluj szerokość LCMS do RSP", False, key="xs_scale",
+                       help="Rozciąga lub ściska profil LCMS tak, aby miał taką samą szerokość jak belka RSP.")
+    wyr = p3.checkbox("Wyrównaj spadek poprzeczny", True, key="xs_level",
+                      help="Odejmuje od profilu spadek poprzeczny (pochylenie jezdni), żeby koleiny były porównywalne.")
+    zacz = align if align in ("right", "left", "center") else "none"
     off = float(A["off_fn"](np.array([chain]))[0])
     rs = lc = None
     rp = get_rsp_profile(A, chain)
@@ -3729,7 +3820,12 @@ def tab_cross(A):
     if lp is not None:
         x, z, kk = lp
         xmin, xmax = (float(x_vals.min()), float(x_vals.max())) if x_vals is not None else (-1.85, 1.85)
-        lc = lcms_cross_section(x, z, xmin, xmax, A["win"], skal, zacz, manual, wyr)
+        man = manual
+        auto_c = None
+        if align == "auto" and rp is not None and x_vals is not None:
+            sh_, auto_c = auto_lateral_shift(x, z, x_vals, -np.asarray(rp[0], dtype=float))
+            man = manual + sh_
+        lc = lcms_cross_section(x, z, xmin, xmax, A["win"], skal, zacz, man, wyr)
         fl, fr = A["lcms"]["rut_l"][kk], A["lcms"]["rut_r"][kk]
         label = (fl, fr) if not A["swap_lr"] else (fr, fl)
         if A["lcms_source"] == "calc":
@@ -3748,8 +3844,17 @@ def tab_cross(A):
     else:
         fig = fig_cross_section(rs, lc, f"Przekrój – RSP {km_str(chain)} / LCMS {km_str(chain + off)}", show_rh, show_lh, label,
                                 (min(-1.85, (x_vals.min() if x_vals is not None else -1.85)),
-                                 max(1.85, (x_vals.max() if x_vals is not None else 1.85))))
+                                 max(1.85, (x_vals.max() if x_vals is not None else 1.85))),
+                                op_rsp=op_rsp, op_lcms=op_lcms, show_rsp_profile=show_rp, show_lcms_profile=show_lp)
         plot(fig, "xs_fig")
+        if lc is not None:
+            tx = (f"Profil LCMS przesunięty poprzecznie o **{lc['shift']:+.2f} m** względem współrzędnych z pliku "
+                  f"(zakres LCMS po przesunięciu: {float(np.min(lc['x'])):+.2f} … {float(np.max(lc['x'])):+.2f} m, "
+                  f"belka RSP: {float(x_vals.min()) if x_vals is not None else float('nan'):+.3f} … "
+                  f"{float(x_vals.max()) if x_vals is not None else float('nan'):+.3f} m).")
+            if align == "auto" and auto_c is not None and not np.isnan(auto_c):
+                tx += f" Korelacja kształtu RSP–LCMS: {auto_c:.2f}."
+            st.caption(tx)
     row = p[p["Pikietaz"] == chain]
     if len(row):
         r = row.iloc[0]
@@ -4198,27 +4303,72 @@ def file_registry_ui(refs):
 def sidebar_settings():
     sb = st.sidebar
     sb.header("Ustawienia analizy")
-    sb.number_input("Tolerancja zgodności ± [mm]", 0.5, 10.0, 2.0, 0.5, key="tol")
-    sb.selectbox("Długość odcinka oceny DSN [m]", [25, 50, 100, 200], index=1, key="sec_len")
-    sb.slider("Minimalne pokrycie odcinka [%]", 0, 100, 0, 10, key="min_cover")
-    sb.selectbox("Źródło koleiny RSP", ["auto", "raw", "kolc"], key="rsp_source",
-                 format_func=lambda k: {"auto": "auto (lasery, luki z KOLC)", "raw": "tylko lasery (Wirtualna Łata)", "kolc": "tylko KOLC"}[k])
-    sb.selectbox("KOLC: wartość", ["avg", "max"], key="kolc_param",
-                 format_func=lambda k: {"avg": "uśredniona (L/P)", "max": "maksymalna (ML/MP)"}[k])
-    sb.selectbox("Źródło koleiny LCMS", ["file", "calc", "both"], key="lcms_source",
-                 format_func=lambda k: {"file": "z pliku", "calc": "wyliczona z profili (Wirtualna Łata)", "both": "oba (plik + łata)"}[k])
-    sb.number_input("Okno wygładzania profilu LCMS [pkt]", 1, 101, 31, 2, key="win")
-    sb.checkbox("Zamień lewą/prawą LCMS", False, key="swap_lr")
-    sb.checkbox("Odwróć kierunek LCMS", False, key="reverse_lcms")
-    sb.selectbox("Pikietaże RSP i LCMS", ["auto", "tak", "nie"], key="rel_mode",
-                 format_func=lambda k: {"auto": "auto (względne gdy się nie pokrywają)", "tak": "względne (od 0 m)", "nie": "bezwzględne"}[k])
-    sb.text_input("Kamera PIC (GPS LCMS)", "auto", key="camera")
+    sb.number_input(
+        "Tolerancja zgodności ± [mm]", 0.5, 10.0, 2.0, 0.5, key="tol",
+        help="Dopuszczalna różnica między RSP i LCMS. Aplikacja liczy, w ilu procentach punktów (co 1 m) wynik LCMS "
+             "różni się od RSP nie więcej niż ta wartość. Np. przy 2 mm: wynik 74% oznacza, że w 74% punktów różnica "
+             "wynosi 2 mm lub mniej. Zalecane: 2 mm.")
+    sb.selectbox(
+        "Długość odcinka oceny DSN [m]", [25, 50, 100, 200], index=1, key="sec_len",
+        help="Na odcinkach tej długości liczony jest wskaźnik Hm = E(h) + 2·Dh i klasa stanu DSN (A–D). "
+             "Zgodnie z DSN 2019 stosuje się 50 m.")
+    sb.slider(
+        "Minimalne pokrycie odcinka [%]", 0, 100, 0, 10, key="min_cover",
+        help="Odcinek oceny (np. 50 m) jest pomijany, jeśli ma pomiary w mniejszym procencie swojej długości niż ta "
+             "wartość. Np. 80%: odcinek 50 m, w którym są dane z mniej niż 40 m, nie zostanie oceniony. "
+             "0 = oceniaj wszystkie odcinki, także niepełne (zalecane, gdy nie ma luk w danych).")
+    sb.selectbox(
+        "Źródło koleiny RSP", ["auto", "raw", "kolc"], key="rsp_source",
+        format_func=lambda k: {"auto": "auto (lasery, luki z KOLC)", "raw": "tylko lasery (Wirtualna Łata)", "kolc": "tylko KOLC"}[k],
+        help="Skąd brać głębokość koleiny z RSP: z surowych odczytów laserów (aplikacja liczy ją sama metodą wirtualnej "
+             "łaty) albo z gotowego pliku KOLC. Dla plików .RSP wybierz „tylko lasery”.")
+    sb.selectbox(
+        "KOLC: wartość", ["avg", "max"], key="kolc_param",
+        format_func=lambda k: {"avg": "uśredniona (L/P)", "max": "maksymalna (ML/MP)"}[k],
+        help="Dotyczy tylko plików KOLC: wartość uśredniona czy maksymalna na każdej koleinie.")
+    sb.selectbox(
+        "Źródło koleiny LCMS", ["file", "calc", "both"], key="lcms_source",
+        format_func=lambda k: {"file": "z pliku", "calc": "wyliczona z profili (Wirtualna Łata)", "both": "oba (plik + łata)"}[k],
+        help="„z pliku” – koleiny policzone przez oprogramowanie LCMS (plik Profile_DSN). „wyliczona z profili” – "
+             "aplikacja liczy je sama z pełnego profilu poprzecznego (wolniej). „oba” – oba wyniki do porównania.")
+    sb.number_input(
+        "Okno wygładzania profilu LCMS [pkt]", 0, 101, 0, 2, key="win",
+        help="Wygładzanie profilu poprzecznego LCMS przed wyznaczeniem koleiny. 0 = bez wygładzania, czysty profil "
+             "(zalecane, bo LCMS mierzy bardzo gęsto). Większa wartość (np. 31) uśrednia profil z sąsiednimi punktami "
+             "i zmniejsza szum, ale spłaszcza wąskie koleiny. Działa na przekrój poprzeczny i na koleiny liczone z profili.")
+    sb.checkbox(
+        "Zamień lewą/prawą LCMS", False, key="swap_lr",
+        help="Włącz tylko wtedy, gdy lewa koleina z LCMS wyraźnie odpowiada prawej z RSP (i odwrotnie). "
+             "Zwykle nie trzeba.")
+    sb.checkbox(
+        "Odwróć kierunek LCMS", False, key="reverse_lcms",
+        help="Odwraca kolejność profili LCMS wzdłuż drogi. Włącz, jeśli plik LCMS jest zapisany w kierunku przeciwnym "
+             "do RSP (przebiegi na wykresie są odbite lustrzanie).")
+    sb.selectbox(
+        "Pikietaże RSP i LCMS", ["auto", "tak", "nie"], key="rel_mode",
+        format_func=lambda k: {"auto": "auto (względne gdy się nie pokrywają)", "tak": "względne (od 0 m)", "nie": "bezwzględne"}[k],
+        help="Bezwzględne: pliki mają prawdziwy kilometraż drogi (np. 259+000) i oba systemy są nakładane po nim. "
+             "Względne: każdy plik liczony jest od 0 m od swojego początku (gdy pomiary nie mają wspólnego "
+             "kilometrażu). „auto” wybiera względne tylko wtedy, gdy kilometraże obu plików się nie pokrywają. "
+             "Dla DK25 użyj bezwzględnych albo auto.")
+    sb.text_input(
+        "Kamera PIC (GPS LCMS)", "auto", key="camera",
+        help="Plik GPS z LCMS (PIC XML) zawiera ślad z kilku kamer. Zostaw „auto” – aplikacja wybierze właściwą. "
+             "Zmieniaj tylko wtedy, gdy ślad na mapie jest zły (wpisz np. nazwę kamery z pliku).")
     sb.divider()
     sb.subheader("Przesunięcie LCMS względem RSP")
     st.session_state.setdefault("off_global", 0.0)
     st.session_state.setdefault("off_drift", 0.0)
-    sb.number_input("Offset globalny [m]", step=1.0, key="off_global")
-    sb.number_input("Dryf [m/km]", step=0.05, key="off_drift", format="%.2f")
+    sb.number_input(
+        "Offset globalny [m]", step=1.0, key="off_global",
+        help="Stałe przesunięcie wzdłuż drogi, o które przesuwany jest cały pomiar LCMS względem RSP. Np. +5 oznacza, "
+             "że punkt, który RSP ma na 259+000, LCMS ma na 259+005. Dobiera się go w zakładce „Synchronizacja” "
+             "(przycisk dopasowania).")
+    sb.number_input(
+        "Dryf [m/km]", step=0.05, key="off_drift", format="%.2f",
+        help="Przesunięcie, które narasta z przejechanym dystansem (np. przez różnicę w kalibracji drogomierzy). "
+             "Dryf 0,77 m/km oznacza przesunięcie 0 m na starcie i ok. 15 m po 20 km. Dobiera się go "
+             "w zakładce „Synchronizacja”.")
 
 
 def main():
