@@ -46,19 +46,19 @@ APP_VERSION = "2.0"
 # ==========================================================================
 # 1. STAŁE I NARZĘDZIA
 # ==========================================================================
-# Geometria laserów RSP [m] (-1,695 m do +1,700 m) – taka jak zapisana w plikach .RSP
+# Dokładna geometria laserów RSP [m] (-1,610 m do +1,618 m) – obowiązująca w aplikacji
 DEFAULT_RSP_X_LIST = [
-    -1.695, -1.510, -1.320, -1.160, -1.007, -0.850, -0.700, -0.550, -0.400,
-    -0.200, 0.000, 0.200, 0.400, 0.550, 0.700, 0.850, 1.003, 1.158, 1.318,
-    1.510, 1.700,
+    -1.610, -1.444, -1.285, -1.145, -1.007, -0.850, -0.700, -0.550, -0.400,
+    -0.200, 0.000, 0.200, 0.400, 0.550, 0.700, 0.850, 1.003, 1.140, 1.280,
+    1.440, 1.618,
 ]
 DEFAULT_RSP_X_STR = ", ".join(f"{x:.3f}" for x in DEFAULT_RSP_X_LIST)
 
 # Klasy stanu koleiny wg DSN 2019 (progi dolne klas B, C, D)
 DSN_THRESHOLDS = (11.0, 21.0, 31.0)
 DSN_CLASSES = ("A", "B", "C", "D")
-DSN_COLORS = {"A": "#28a745", "B": "#ffc107", "C": "#fd7e14", "D": "#dc3545"}
-DSN_EMOJI = {"A": "🟢", "B": "🟡", "C": "🟠", "D": "🔴"}
+DSN_COLORS = {"A": "#8fd694", "B": "#1b7f3b", "C": "#ffd400", "D": "#d62728"}  # A jasnozielony, B ciemnozielony, C żółty, D czerwony
+DSN_EMOJI = {"A": "🟢", "B": "🟩", "C": "🟡", "D": "🔴"}
 
 # Typy plików rozpoznawane przez aplikację
 TYPE_RSP_RAW = "RSP_RAW"
@@ -1325,6 +1325,69 @@ def auto_lateral_shift(x_l, z_l, x_r, h_r, max_shift=0.6, step=0.02):
     return (best[0], best[1]) if best[1] > -2 else (0.0, float("nan"))
 
 
+def fit_lcms_to_rsp(lc, rs, max_shift=0.5, step=0.02):
+    """Dopasowuje CAŁY profil LCMS do profilu RSP: przesunięcie poprzeczne + pochylenie (obrót) + podniesienie.
+
+    lc  – wynik lcms_cross_section (profil po wyrównaniu spadku i wyzerowaniu na osi),
+    rs  – wynik rsp_cross_section(zero_l11=True) (wysokość względna do L11).
+    Dla każdego przesunięcia s dobierana jest prosta a + b·x minimalizująca różnicę RSP − LCMS w 21 punktach laserów;
+    wybierane jest s z najmniejszym błędem RMS. Zwraca dict (shift, tilt, a, b, rms, rms0) albo None.
+    """
+    try:
+        xr = np.asarray(rs["x"], dtype=float)
+        yr = np.asarray(rs["y"], dtype=float)
+        xl = np.asarray(lc["x"], dtype=float)
+        zl = np.asarray(lc["z_plot"], dtype=float)
+        ok = np.isfinite(xl) & np.isfinite(zl)
+        xl, zl = xl[ok], zl[ok]
+        if len(xl) < 10 or len(xr) < 5:
+            return None
+        o = np.argsort(xl)
+        xl, zl = xl[o], zl[o]
+        best = None
+        rms0 = None
+        for s in np.arange(-max_shift, max_shift + 1e-9, step):
+            zi = np.interp(xr, xl + s, zl, left=np.nan, right=np.nan)
+            m = np.isfinite(zi)
+            if m.sum() < max(8, int(0.6 * len(xr))):
+                continue
+            d = yr[m] - zi[m]
+            b, a = np.polyfit(xr[m], d, 1)
+            res = d - (a + b * xr[m])
+            rms = float(np.sqrt(np.mean(res ** 2)))
+            if abs(s) < 1e-9:
+                rms0 = float(np.sqrt(np.mean((d - d.mean()) ** 2)))
+            if best is None or rms < best["rms"]:
+                best = {"shift": float(s), "a": float(a), "b": float(b), "rms": rms}
+        if best is None:
+            return None
+        best["tilt_deg"] = float(np.degrees(np.arctan(best["b"] / 1000.0)))  # b: mm/m -> kąt
+        best["rms0"] = rms0
+        return best
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def apply_fit_to_lcms(lc, fit):
+    """Nakłada na wynik lcms_cross_section przesunięcie/pochylenie z fit_lcms_to_rsp (nie zmienia wartości kolein)."""
+    a, b, s = fit["a"], fit["b"], fit["shift"]
+    out = dict(lc)
+    out["x"] = np.asarray(lc["x"], dtype=float) + s
+    out["x_l"] = np.asarray(lc["x_l"], dtype=float) + s
+    out["x_r"] = np.asarray(lc["x_r"], dtype=float) + s
+    out["z_plot"] = np.asarray(lc["z_plot"], dtype=float) + a + b * out["x"]
+    out["lata_l"] = np.asarray(lc["lata_l"], dtype=float) + a + b * out["x_l"]
+    out["lata_r"] = np.asarray(lc["lata_r"], dtype=float) + a + b * out["x_r"]
+    out["x_kl"] = float(lc["x_kl"]) + s
+    out["x_kp"] = float(lc["x_kp"]) + s
+    out["y_l_prof"] = float(lc["y_l_prof"]) + a + b * out["x_kl"]
+    out["y_l_lata"] = float(lc["y_l_lata"]) + a + b * out["x_kl"]
+    out["y_r_prof"] = float(lc["y_r_prof"]) + a + b * out["x_kp"]
+    out["y_r_lata"] = float(lc["y_r_lata"]) + a + b * out["x_kp"]
+    out["shift"] = float(lc["shift"]) + s
+    return out
+
+
 # ==========================================================================
 # 5. ZESTAWY DANYCH: SCALANIE PLIKÓW, PIKIETAŻ, SIATKA 1 m, DOPASOWANIE LCMS → RSP
 # ==========================================================================
@@ -1970,10 +2033,10 @@ def rpd_fine_table(rsp_v, lcms_v, edges=(0, 10, 20, 30, 50, 100, np.inf)):
     return pd.DataFrame(rows)
 
 
-def depth_bin_table(a, b, edges=(0, 5, 10, 15, 20, 30, 1e9), tol=2.0):
+def depth_bin_table(a, b, edges=(0, 5, 10, 15, 20, 30, 1e9), tol=2.0, by="mean"):
     """Zgodność w funkcji głębokości (przedziały wg średniej z obu systemów)."""
     a, b = clean_pair(a, b)
-    m = (a + b) / 2.0
+    m = a if by == "rsp" else (a + b) / 2.0   # by="rsp": przedział wg RSP (odniesienie); "mean": wg średniej obu systemów
     rows = []
     for lo, hi in zip(edges[:-1], edges[1:]):
         sel = (m >= lo) & (m < hi)
@@ -2891,9 +2954,9 @@ def make_50m_bar_chart(df_sec_dsn, param_prefix="P_KOL", title="Prawa Koleina (P
             marker_color=[get_dsn_color(k) for k in df_sec_dsn[col_l_k]], opacity=0.55,
             marker_pattern_shape="/", customdata=df_sec_dsn["Odcinek"],
             hovertemplate="%{customdata}<br>LCMS Hm: %{y} mm<extra></extra>"))
-    fig.add_hline(y=11, line_dash="dash", line_color="#ffc107", annotation_text="Próg B (11mm)")
-    fig.add_hline(y=21, line_dash="dash", line_color="#fd7e14", annotation_text="Próg C (21mm)")
-    fig.add_hline(y=31, line_dash="dash", line_color="#dc3545", annotation_text="Próg D (31mm)")
+    fig.add_hline(y=11, line_dash="dash", line_color=DSN_COLORS["B"], annotation_text="Próg B (11 mm)")
+    fig.add_hline(y=21, line_dash="dash", line_color=DSN_COLORS["C"], annotation_text="Próg C (21 mm)")
+    fig.add_hline(y=31, line_dash="dash", line_color=DSN_COLORS["D"], annotation_text="Próg D (31 mm)")
     fig.update_layout(title=f"Ocena Hm dla odcinków {length:g} m – {title} (pełne słupki: RSP, kreskowane: LCMS)",
                       xaxis_title="Pikietaż (km+m)", yaxis_title="Ocena Hm [mm]", barmode="overlay", height=480,
                       margin=dict(l=50, r=20, t=60, b=40))
@@ -3060,6 +3123,7 @@ def fig_cross_section(rs, lc, title, show_rsp_hull=True, show_lcms_hull=True, la
     fig.add_vline(x=0, line_width=1, line_dash="dot", line_color="gray", annotation_text="Oś L11 (0.0 m)")
     fig.update_layout(title=title, xaxis_title="Pozycja czujnika na belce [m]", yaxis_title=y_label, height=580,
                       hovermode="x unified", xaxis=dict(range=list(x_range), dtick=0.2),
+                      margin=dict(l=60, r=20, t=170, b=50),
                       yaxis=dict(autorange="reversed" if reverse else True),
                       legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
     return fig
@@ -3117,8 +3181,38 @@ def map_zoom_for(lat, lon):
     return float(np.clip(math.log2(1406.0 / span) - 0.5, 3, 17))
 
 
-def finish_map(fig, center_lat, center_lon, zoom=13, height=560):
+def class_polygons_layers(lat, lon, classes, half_width_m=6.0):
+    """Warstwy mapy (wielokąty GeoJSON o stałej szerokości w METRACH) – powiększają się razem z przybliżaniem mapy."""
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    layers = []
+    for k in ("A", "B", "C", "D"):
+        feats = []
+        for i in range(len(lat) - 1):
+            if classes[i] != k or not (np.isfinite(lat[i]) and np.isfinite(lat[i + 1])):
+                continue
+            la0 = math.radians(0.5 * (lat[i] + lat[i + 1]))
+            dy = (lat[i + 1] - lat[i]) * 111320.0
+            dx = (lon[i + 1] - lon[i]) * 111320.0 * math.cos(la0)
+            n = math.hypot(dx, dy)
+            if n < 1e-3:
+                continue
+            nx, ny = -dy / n, dx / n
+            ox = nx * half_width_m / (111320.0 * math.cos(la0))
+            oy = ny * half_width_m / 111320.0
+            ring = [[lon[i] - ox, lat[i] - oy], [lon[i + 1] - ox, lat[i + 1] - oy],
+                    [lon[i + 1] + ox, lat[i + 1] + oy], [lon[i] + ox, lat[i] + oy], [lon[i] - ox, lat[i] - oy]]
+            feats.append({"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [ring]}})
+        if feats:
+            layers.append({"sourcetype": "geojson", "source": {"type": "FeatureCollection", "features": feats},
+                           "type": "fill", "color": DSN_COLORS[k], "opacity": 0.95, "below": ""})
+    return layers
+
+
+def finish_map(fig, center_lat, center_lon, zoom=13, height=560, layers=None):
     cfg = dict(center=dict(lat=center_lat, lon=center_lon), zoom=zoom)
+    if layers:
+        cfg["layers"] = layers
     try:
         if hasattr(go, "Scattermap"):
             fig.update_layout(map_style="open-street-map", map=cfg, margin=dict(l=0, r=0, t=20, b=0), height=height)
@@ -3308,14 +3402,13 @@ def rsp_geometry_ui(R):
     """Pozycje X laserów RSP: z pliku / domyślne (edytowalne) albo stały odstęp – jak w poprzedniej wersji."""
     n = R["raw"]["lasers"].shape[1] if R is not None and R.get("raw") is not None else 21
     file_x = R["raw"].get("x_pos") if R is not None and R.get("raw") is not None else None
-    base = file_x if file_x and len(file_x) == n else DEFAULT_RSP_X_LIST
+    base = DEFAULT_RSP_X_LIST if n == len(DEFAULT_RSP_X_LIST) else (file_x if file_x and len(file_x) == n else DEFAULT_RSP_X_LIST)
     with st.sidebar.expander("Geometria laserów RSP"):
-        mode = st.radio("Typ konfiguracji czujników RSP:", ["Z pliku / domyślna RSP", "Stały odstęp (równomierny)"], key="rsp_geo",
-                        help="„Z pliku”: pozycje laserów odczytane z nagłówka pliku RSP (lub domyślne -1,695 … +1,700 m). "
-                             "Zmieniaj tylko wtedy, gdy belka ma inny rozstaw laserów.")
-        if mode.startswith("Z pliku"):
-            st.caption(("Pozycje odczytane z pliku RSP." if file_x else "Pozycje domyślne (plik nie zawiera geometrii laserów).")
-                       + f" Zakres: {min(base):+.3f} … {max(base):+.3f} m.")
+        mode = st.radio("Typ konfiguracji czujników RSP:", ["Domyślna RSP (−1,610 … +1,618 m)", "Stały odstęp (równomierny)"], key="rsp_geo",
+                        help="Domyślnie obowiązuje rozstaw laserów od -1,610 do +1,618 m. Zmieniaj tylko wtedy, gdy belka ma inny rozstaw.")
+        if mode.startswith("Domyślna"):
+            st.caption(f"Obowiązująca geometria laserów RSP. Zakres: {min(base):+.3f} … {max(base):+.3f} m "
+                       "(pozycje z nagłówka pliku nie są używane).")
             sig_ = abs(hash(tuple(round(float(x), 3) for x in base))) % 10 ** 8
             txt = st.text_area("Pozycje X [m] dla laserów:", ", ".join(f"{x:.3f}" for x in base), height=90, key=f"rsp_x_txt_{n}_{sig_}")
             try:
@@ -3432,6 +3525,45 @@ def stats_table(stx, tol):
                 "–" if v is None or (isinstance(v, float) and np.isnan(v)) else (f"{v:.{nd}f}" if nd else f"{int(round(v))}"))
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def explain(title, text, expanded=False):
+    """Rozwijany opis „co to jest i jak czytać” (zwykły tekst/markdown)."""
+    with st.expander("ℹ️ " + title, expanded=expanded):
+        st.markdown(text)
+
+
+DSN_LEGEND = ("**Klasy DSN 2019 (wskaźnik Hm):** A – poniżej 11 mm (stan najlepszy), B – 11–20 mm, C – 21–30 mm, "
+              "D – 31 mm i więcej (stan najgorszy).")
+
+
+STATS_GLOSSARY = """
+| Miara | Co oznacza i jak ją czytać |
+|---|---|
+| **n** | liczba metrów drogi, w których są oba pomiary (RSP i LCMS) |
+| **n efektywne** | liczba „niezależnych” punktów – sąsiednie metry są do siebie podobne, więc rzeczywista informacja jest mniejsza niż n |
+| **Średnia RSP / LCMS** | średnia głębokość koleiny z każdego systemu [mm] |
+| **Bias LCMS−RSP** | średnia różnica (LCMS minus RSP). Dodatni: LCMS pokazuje koleiny głębsze, ujemny: płytsze. Mówi o *systematycznym* przesunięciu poziomu |
+| **Bias – 95% CI** | przedział, w którym z 95% pewnością leży prawdziwy bias; jeśli nie zawiera 0, bias jest istotny statystycznie |
+| **SD różnic** | odchylenie standardowe różnic – typowy *rozrzut* wyników pojedynczych metrów wokół biasu (mniej = lepiej) |
+| **Granice zgodności** | bias ± 1,96·SD – przedział, w którym mieści się 95% różnic pojedynczych metrów (Bland–Altman) |
+| **RMSE** | pierwiastek ze średniego kwadratu różnic – łączny, typowy błąd (bias + rozrzut) |
+| **MAE** | średnia wartość bezwzględna różnic [mm] – „średnio o tyle się różnią” |
+| **Mediana modułu różnic** | połowa metrów różni się o mniej niż ta wartość |
+| **95. percentyl modułu różnic** | 95% metrów różni się o mniej niż ta wartość; pozostałe 5% to największe różnice |
+| **Maks. moduł różnic** | największa różnica na całym odcinku |
+| **Korelacja Pearsona r** | czy oba systemy wskazują te same miejsca jako głębsze i płytsze (1 = identyczny kształt; > 0,95 bardzo dobra; 0,85–0,95 umiarkowana) |
+| **Korelacja Spearmana** | jak r, ale dotyczy zgodności *kolejności* wartości; mniej wrażliwa na pojedyncze skrajne punkty |
+| **CCC Lina** | zgodność uwzględniająca zarówno kształt (korelację), jak i poziom (bias); 1 = pełna zgodność |
+| **ICC(A,1)** | podobna miara zgodności bezwzględnej; > 0,9 – doskonała, 0,75–0,9 – dobra |
+| **Nachylenie MNK** | z regresji LCMS = a + b·RSP; b = 1 oznacza brak błędu proporcjonalnego, b > 1 – LCMS zawyża głębsze koleiny |
+| **Wyraz wolny MNK** | a z tej regresji [mm] – stałe przesunięcie przy RSP = 0 |
+| **Nachylenie ortogonalne (Deming)** | jak MNK, ale uwzględnia, że oba systemy mają błąd; bardziej wiarygodne przy ocenie b |
+| **SD(LCMS)/SD(RSP)** | stosunek zmienności: > 1 oznacza, że LCMS jest „bardziej poszarpany” (większy szum) |
+| **% w tolerancji ±X mm** | odsetek metrów, w których różnica nie przekracza tolerancji z panelu bocznego (domyślnie 2 mm); także ±1, ±3, ±5 mm |
+| **% punktów LCMS > RSP** | w ilu % metrów LCMS pokazał więcej niż RSP (jeśli ≈ 50%, brak systematycznej różnicy) |
+| **Mediana RPD** | typowa względna różnica w % (patrz opis RPD niżej) |
+"""
 
 
 # ==========================================================================
@@ -3636,20 +3768,42 @@ def tab_sync(A):
         return
     rL, rR, lL, lR, rc0, lc0 = make_pairs_src(A)
     c1, c2, c3 = st.columns(3)
-    metric = c1.selectbox("Seria do korelacji", ["Max", "L", "R", "L+R"], key="sy_metric")
-    hp = c2.number_input("Okno filtru górnoprzepustowego [m] (0 = brak)", 0, 1001, 0, 10, key="sy_hp0")
-    msr = c3.number_input("Zakres szukania ± [m]", 10, 3000, 400, 10, key="sy_max2")
+    metric = c1.selectbox("Seria do korelacji", ["Max", "L", "R", "L+R"], key="sy_metric",
+                          help="Którą krzywą koleiny porównywać: Max = koleina maksymalna (większa z lewej i prawej), "
+                               "L = lewa, R = prawa, L+R = obie naraz. Zalecane: Max.")
+    hp = c2.number_input("Okno filtru górnoprzepustowego [m] (0 = brak)", 0, 1001, 0, 10, key="sy_hp0",
+                         help="Filtr usuwa z obu krzywych wolne zmiany (np. cały odcinek jest stopniowo głębszy), zostawiając "
+                              "tylko szybkie zmiany koleiny na krótkim dystansie – to one pozwalają precyzyjnie ustawić pikietaż. "
+                              "Wartość to długość okna uśredniania odejmowanego od krzywej, np. 101 m. 0 = bez filtra (zalecane "
+                              "dla pierwszego szukania); 101 m warto włączyć, gdy na odcinku są długie, powolne trendy.")
+    msr = c3.number_input("Zakres szukania ± [m]", 10, 3000, 100, 10, key="sy_max2",
+                          help="O ile metrów program próbuje przesunąć LCMS względem RSP w obie strony (−X … +X). To NIE jest liczba "
+                               "porównywanych profili: za każdym razem porównywany jest cały odcinek, a przesunięcie zmienia się co 1 m. "
+                               "100 m wystarcza, gdy pomiary zaczynały się mniej więcej w tym samym miejscu. Zwiększ (np. 400 m), "
+                               "jeśli start pomiarów różnił się o więcej, np. LCMS ruszył z innego kilometra.")
     cur = float(st.session_state.get("off_global", 0.0))
     with st.container(border=True):
         st.markdown("**1. Offset globalny (korelacja krzyżowa)**")
+        explain("Co to jest korelacja krzyżowa i jak ją czytać",
+                "Program **przesuwa** krzywą LCMS względem krzywej RSP o −X … +X metrów (co 1 m) i dla każdego przesunięcia liczy "
+                "**korelację** – liczbę od −1 do 1 mówiącą, jak bardzo obie krzywe rosną i maleją w tych samych miejscach "
+                "(1 = idealnie zgodne kształty). Wykres poniżej pokazuje tę korelację w funkcji przesunięcia.\n\n"
+                "- **Wyraźny, wąski szczyt** (czerwona linia) – znaleziono przesunięcie, przy którym pomiary się pokrywają.\n"
+                "- **Płaski wykres bez szczytu** – brak wyraźnego przesunięcia stałego; zwykle oznacza dryf (przesunięcie rosnące z "
+                "kilometrem) – użyj bloku 1b.\n"
+                "- **Najlepsze przesunięcie [m]** – o tyle trzeba przesunąć LCMS, by pasował do RSP.\n"
+                "- **Korelacja w maksimum** – jak dobrze pasują krzywe po tym przesunięciu. **Korelacja przy bieżącym** – jak pasują przy "
+                "przesunięciu ustawionym teraz w panelu bocznym. Duża różnica = warto zastosować propozycję.\n"
+                "- **Drugi pik (poza ±5 m)** – najwyższa korelacja w innym miejscu wykresu. Jeśli jest zbliżona do głównej, "
+                "wynik jest niejednoznaczny (np. na prostym, jednolitym odcinku) i należy go sprawdzić na wykresie wzdłużnym.")
         lag, cc, c2nd, lags, corr = cached_global_search(rL, rR, lL, lR, rc0, lc0, A["a0"], A["a1"], metric, int(hp), int(msr))
         k = int(np.argmin(np.abs(lags - round(cur))))
         cur_corr = float(corr[k]) if not np.isnan(corr[k]) else np.nan
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Najlepsze przesunięcie [m]", nice_number(lag, 0))
-        m2.metric("Korelacja w maksimum", nice_number(cc, 3))
-        m3.metric("Korelacja przy bieżącym", nice_number(cur_corr, 3))
-        m4.metric("Drugi pik (poza ±5 m)", nice_number(c2nd, 3))
+        m1.metric("Najlepsze przesunięcie [m]", nice_number(lag, 0), help="O tyle metrów trzeba przesunąć LCMS względem RSP, żeby obie krzywe najlepiej się pokrywały.")
+        m2.metric("Korelacja w maksimum", nice_number(cc, 3), help="Korelacja obu krzywych po zastosowaniu najlepszego przesunięcia (1 = idealna zgodność kształtu).")
+        m3.metric("Korelacja przy bieżącym", nice_number(cur_corr, 3), help="Korelacja przy przesunięciu ustawionym teraz w panelu bocznym (offset + dryf + sekcje).")
+        m4.metric("Drugi pik (poza ±5 m)", nice_number(c2nd, 3), help="Najwyższa korelacja w odległości > 5 m od głównego szczytu. Jeśli bliska głównej – wynik niejednoznaczny.")
         plot(fig_corr_curve(lags, corr, lag), "sy_corr")
         if not np.isnan(lag) and st.button(f"Zastosuj offset globalny {lag:+.0f} m", key="sy_apply_g"):
             set_pending(off_global=float(lag), off_ref=float(A["a0"]))
@@ -3657,7 +3811,9 @@ def tab_sync(A):
         st.markdown("**1b. Offset + dryf liniowy (maksimum korelacji surowych serii)**")
         st.caption("Szuka stałego przesunięcia i dryfu skali drogomierzy (m/km) dających najwyższą korelację RSP–LCMS. "
                    "To tylko 2 parametry, więc nie „dopasowuje szumu” jak dopasowanie segmentów.")
-        if st.button("Znajdź offset i dryf", key="sy_opt_btn"):
+        if st.button("Znajdź offset i dryf", key="sy_opt_btn",
+                     help="Szuka dwóch liczb: przesunięcia na początku odcinka i dryfu (o ile metrów przesunięcie rośnie na każdym kilometrze). "
+                          "Zalecana metoda, gdy pomiary RSP i LCMS rozjeżdżają się wraz z dystansem (różne drogomierze)."):
             with st.spinner("Przeszukiwanie…"):
                 rm = np.fmax(rL, rR)
                 lm = np.fmax(lL, lR)
@@ -3675,13 +3831,31 @@ def tab_sync(A):
     with st.container(border=True):
         st.markdown("**2. Lokalne przesunięcia i dryf (okna przesuwne)**")
         w1, w2, w3 = st.columns(3)
-        win = w1.number_input("Okno [m]", 300, 5000, 1000, 100, key="sy_win")
-        hop = w2.number_input("Krok okna [m]", 50, 2000, 250, 50, key="sy_hop")
-        loc_rng = w3.number_input("Zakres lokalny ± [m] (wokół offsetu)", 10, 300, 40, 10, key="sy_locrng")
+        explain("Jak czytać wykres lokalnych przesunięć",
+                "Odcinek jest cięty na **okna** (np. 1000 m, co 250 m). W każdym oknie osobno szukane jest przesunięcie, "
+                "przy którym RSP i LCMS najlepiej się pokrywają.\n\n"
+                "- **Kropka** = jedno okno. Położenie poziome: środek okna (pikietaż). Położenie pionowe: najlepsze przesunięcie "
+                "LCMS względem RSP w tym oknie [m]. **Kolor kropki** = korelacja w oknie (żółty = wysoka, wiarygodna; "
+                "ciemnofioletowy = niska, kropka mało wiarygodna).\n"
+                "- **Czerwona linia** = prosta dopasowana do kropek: jej wartość na początku to offset, a nachylenie to dryf [m/km].\n"
+                "- **Czarna kropkowana linia** = przesunięcie ustawione obecnie w programie.\n\n"
+                "**Interpretacja:** kropki układające się wzdłuż jednej prostej – wystarczy offset + dryf. Kropki równoległe do osi "
+                "poziomej – stałe przesunięcie bez dryfu. Pojedyncze kropki wyskakujące z linii – zwykle rondo, skrzyżowanie, "
+                "zatrzymanie lub odcinek bez wyraźnych kolein (takie okna pomija dopasowanie). Schodkowy przebieg kropek – "
+                "pojazd gubił lub dodawał dystans w konkretnych miejscach (użyj offsetów sekcji).")
+        win = w1.number_input("Okno [m]", 300, 5000, 1000, 100, key="sy_win",
+                              help="Długość odcinka, na którym w jednym oknie szukane jest przesunięcie. Dłuższe okno = stabilniejszy wynik, ale mniej szczegółowy.")
+        hop = w2.number_input("Krok okna [m]", 50, 2000, 250, 50, key="sy_hop",
+                              help="Co ile metrów zaczyna się kolejne okno. Mniejszy krok = więcej kropek na wykresie.")
+        loc_rng = w3.number_input("Zakres lokalny ± [m] (wokół offsetu)", 10, 300, 40, 10, key="sy_locrng",
+                                  help="Jak daleko od bieżącego offsetu program szuka przesunięcia w każdym oknie.")
+        hp_loc = st.number_input("Okno filtru górnoprzepustowego [m]", 0, 1001, 101, 10, key="sy_hp_loc",
+                                 help="Usuwa wolne trendy (zmiany ogólnego poziomu koleiny na długim dystansie), żeby w oknach 1000 m "
+                                      "dopasowywać tylko lokalne wzloty i spadki koleiny. 101 m to wartość zalecana; 0 = wyłączony.")
         if st.button("Policz mapę lokalnych przesunięć", key="sy_run_local"):
             with st.spinner("Liczenie okien…"):
                 st.session_state["lagmap"] = cached_lag_map(rL, rR, lL, lR, rc0, lc0, A["a0"], A["a1"], metric,
-                                                            101, int(win), int(hop), int(max(msr, abs(cur) + loc_rng)))
+                                                            int(hp_loc), int(win), int(hop), int(max(msr, abs(cur) + loc_rng)))
         dfl = st.session_state.get("lagmap")
         if dfl is not None and len(dfl):
             fit = fit_drift(dfl, A["a0"])
@@ -3694,7 +3868,10 @@ def tab_sync(A):
                 if b1.button("Zastosuj offset + dryf", key="sy_apply_fit"):
                     st.session_state["sec_off_df"] = None
                     set_pending(off_global=float(fit["offset_ref"]), off_drift=float(fit["drift_per_km"]), off_ref=float(A["a0"]))
-                if b2.button("Wypełnij offsety sekcji (co 1 km) z lagów", key="sy_apply_sec"):
+                if b2.button("Wypełnij offsety sekcji (co 1 km) z lagów", key="sy_apply_sec",
+                             help="Zamiast jednej prostej (offset + dryf) wpisuje do tabeli „Offsety sekcji” osobne przesunięcie dla każdego "
+                                  "kilometra, odczytane z kropek (mediana w kilometrze). Użyj, gdy kropki nie leżą na jednej prostej, tylko "
+                                  "tworzą „schodki”. Offset globalny i dryf są wtedy zerowane, żeby przesunięcia się nie dublowały."):
                     edges = list(np.arange(A["a0"], A["a1"], 1000.0))
                     offs = section_offsets_from_lags(dfl, edges + [A["a1"] + 1], default=cur)
                     st.session_state["sec_off_df"] = pd.DataFrame({"Od [m]": edges, "Offset [m]": offs})
@@ -3704,6 +3881,7 @@ def tab_sync(A):
             st.info("Brak wiarygodnych okien (za mało wspólnych danych lub zbyt słaba korelacja).")
     with st.container(border=True):
         st.markdown("**3. Offsety sekcji (ręczna edycja)**")
+        st.caption("Każdy wiersz: od którego pikietażu obowiązuje dodatkowe przesunięcie [m]. Przydatne np. po rondzie lub zatrzymaniu pojazdu.")
         sdf = section_edges_df()
         if sdf is None:
             sdf = pd.DataFrame({"Od [m]": [float(A["a0"])], "Offset [m]": [0.0]})
@@ -3795,10 +3973,12 @@ def tab_cross(A):
     op_lcms = v4.slider("Przezroczystość LCMS", 0.1, 1.0, 0.7, 0.05, key="xs_op_l")
     p1, p2, p3 = st.columns([2, 1, 1])
     align = p1.radio(
-        "Dopasowanie poprzeczne profilu LCMS do RSP", ["right", "left", "center", "auto", "none"], horizontal=True, key="xs_align",
-        format_func=lambda k: {"right": "prawa krawędź", "left": "lewa krawędź", "center": "środek", "auto": "automatyczne (kształt)",
-                               "none": "bez dopasowania"}[k],
-        help="Jak ustawić profil LCMS względem profilu RSP w poziomie. Prawa/lewa krawędź: skrajny punkt profilu LCMS jest "
+        "Dopasowanie poprzeczne profilu LCMS do RSP", ["fit", "right", "left", "center", "auto", "none"], horizontal=True, key="xs_align",
+        format_func=lambda k: {"fit": "dopasuj cały profil (przesunięcie + pochylenie)", "right": "prawa krawędź", "left": "lewa krawędź",
+                               "center": "środek", "auto": "automatyczne (kształt)", "none": "bez dopasowania"}[k],
+        help="„Dopasuj cały profil”: program przesuwa profil LCMS w poziomie, obraca (pochyla) go i podnosi/obniża tak, żeby jak "
+             "najlepiej pokrył 21 punktów RSP – to zalecany tryb do oglądania obu przekrojów. Wartości dopasowania podane są pod wykresem. "
+             "Pozostałe tryby: Prawa/lewa krawędź: skrajny punkt profilu LCMS jest "
              "ustawiany na skrajnym laserze RSP. Środek: środek szerokości LCMS na środku belki RSP. Automatyczne: "
              "przesunięcie dobierane tak, aby kształt profilu najlepiej pasował do RSP. Bez dopasowania: współrzędne "
              "z pliku LCMS. Wartość zastosowanego przesunięcia jest podana pod wykresem.")
@@ -3806,7 +3986,7 @@ def tab_cross(A):
                        help="Rozciąga lub ściska profil LCMS tak, aby miał taką samą szerokość jak belka RSP.")
     wyr = p3.checkbox("Wyrównaj spadek poprzeczny", True, key="xs_level",
                       help="Odejmuje od profilu spadek poprzeczny (pochylenie jezdni), żeby koleiny były porównywalne.")
-    zacz = align if align in ("right", "left", "center") else "none"
+    zacz = align if align in ("right", "left", "center") else ("right" if align == "fit" else "none")
     off = float(A["off_fn"](np.array([chain]))[0])
     rs = lc = None
     rp = get_rsp_profile(A, chain)
@@ -3826,6 +4006,11 @@ def tab_cross(A):
             sh_, auto_c = auto_lateral_shift(x, z, x_vals, -np.asarray(rp[0], dtype=float))
             man = manual + sh_
         lc = lcms_cross_section(x, z, xmin, xmax, A["win"], skal, zacz, man, wyr)
+        fit_info = None
+        if align == "fit" and rs is not None and not rs.get("reverse_y"):
+            fit_info = fit_lcms_to_rsp(lc, rs)
+            if fit_info is not None:
+                lc = apply_fit_to_lcms(lc, fit_info)
         fl, fr = A["lcms"]["rut_l"][kk], A["lcms"]["rut_r"][kk]
         label = (fl, fr) if not A["swap_lr"] else (fr, fl)
         if A["lcms_source"] == "calc":
@@ -3854,6 +4039,14 @@ def tab_cross(A):
                   f"{float(x_vals.max()) if x_vals is not None else float('nan'):+.3f} m).")
             if align == "auto" and auto_c is not None and not np.isnan(auto_c):
                 tx += f" Korelacja kształtu RSP–LCMS: {auto_c:.2f}."
+            if align == "fit":
+                if fit_info is not None:
+                    tx += (f" Dopasowanie całego profilu: dodatkowe przesunięcie {fit_info['shift']:+.2f} m, pochylenie "
+                           f"{fit_info['b']:+.1f} mm/m (≈ {fit_info['tilt_deg']:+.2f}°), podniesienie {fit_info['a']:+.1f} mm; "
+                           f"średni błąd w punktach laserów {fit_info['rms']:.1f} mm"
+                           + (f" (bez dopasowania {fit_info['rms0']:.1f} mm)." if fit_info.get("rms0") is not None else "."))
+                else:
+                    tx += " Dopasowanie całego profilu niedostępne (brak profilu RSP lub tryb „surowy”) – użyto prawej krawędzi."
             st.caption(tx)
     row = p[p["Pikietaz"] == chain]
     if len(row):
@@ -3866,6 +4059,14 @@ def tab_cross(A):
         st.caption(f"Z geometrii wykresu: RSP lewa {rs['rut_l']:.1f}, prawa {rs['rut_r']:.1f} mm; "
                    f"LCMS (wirtualna łata) lewa {lc['rut_l_calc']:.1f}, prawa {lc['rut_r_calc']:.1f} mm.")
     with st.expander("Mapa cieplna profili LCMS wokół wybranego pikietażu"):
+        explain("Jak czytać mapę cieplną",
+                "Każdy **poziomy wiersz** to jeden profil poprzeczny LCMS (jeden pikietaż, oś pionowa), ułożony od lewej do prawej krawędzi "
+                "pasa (oś pozioma, 0 = oś). **Kolor** pokazuje wysokość nawierzchni względem osi po wyrównaniu spadku poprzecznego: "
+                "**niebieski = zagłębienie (koleina)**, czerwony = wypukłość, biały = poziom osi. Czarna kropkowana linia to wybrany pikietaż.\n\n"
+                "- Dwa niebieskie, pionowe pasy to koleiny w śladach kół. Im ciemniejszy niebieski, tym głębsza koleina.\n"
+                "- Pas przechodzący równo w dół = koleina o stałej głębokości i położeniu; zanikanie lub rozszerzanie = zmiana głębokości.\n"
+                "- Skokowa zmiana koloru w poprzek wierszy = poprawka nawierzchni, łata albo przerwa w danych (biała pustka).\n"
+                "- Mapa pozwala szybko ocenić, czy wskazanie z jednego punktu to koleina trwała, czy lokalne zaburzenie profilu.")
         half = st.slider("Zakres ± [m]", 5, 150, 40, key="xs_hm_half")
         step = max(1, int(half * 2 / 120))
         cs = np.arange(chain - half, chain + half + 1, step)
@@ -3943,11 +4144,21 @@ def tab_long(A):
     st.subheader("Przebieg wzdłużny koleiny")
     p = A["pairs"]
     lo, hi = float(A["a0"]), float(A["a1"])
+    explain("Jak czytać wykresy przebiegu wzdłużnego",
+            "Trzy wykresy (koleina maksymalna, lewa, prawa) pokazują głębokość koleiny [mm] w każdym metrze drogi. "
+            "**Niebieska linia = RSP, zielona = LCMS.** Jeżeli oba systemy mierzą to samo i są dobrze zsynchronizowane, linie leżą na sobie. "
+            "Kolorowe pasy w tle to klasy DSN (zielone A/B, żółte C, czerwone D).\n\n"
+            "- **Linie biegną razem, tylko jedna jest stale wyżej** – różnica poziomu (bias) systemów, kwestia kalibracji.\n"
+            "- **Kształty podobne, ale przesunięte w poziomie, i przesunięcie rośnie** – błąd pikietażu (dryf). Zrób synchronizację.\n"
+            "- **Pojedyncze ostre szczyty tylko w jednym systemie** – miejsca do sprawdzenia na zdjęciach (łata, studzienka, uszkodzenie).\n\n"
+            "Wykres można powiększać zaznaczając myszą fragment (dwuklik = reset). Widok można też ustawić polami „Widok od” i „Szerokość widoku”.")
     c1, c2 = st.columns(2)
-    v0 = c1.number_input("Widok od [m]", lo, hi, lo, 100.0, key="lg_v0b")
-    span = c2.number_input("Szerokość widoku [m] (0 = cały odcinek)", 0.0, hi - lo, 0.0, 100.0, key="lg_span2")
+    v0 = c1.number_input("Widok od [m]", lo, hi, lo, 100.0, key="lg_v0b", help="Pikietaż, od którego zaczyna się pokazywany fragment wykresu.")
+    span = c2.number_input("Szerokość widoku [m] (0 = cały odcinek)", 0.0, hi - lo, 0.0, 100.0, key="lg_span2",
+                           help="Długość pokazywanego fragmentu w metrach. 0 = pokaż cały odcinek.")
     view = (v0, min(hi, v0 + span)) if span > 0 else (lo, hi)
-    bands = st.checkbox("Pokaż klasy DSN (tło)", True, key="lg_bands")
+    bands = st.checkbox("Pokaż klasy DSN (tło)", True, key="lg_bands",
+                        help="Koloruje tło wykresu według klas DSN: koleina poniżej 11 mm = klasa A, 11–20 mm = B, 21–30 mm = C, od 31 mm = D.")
     v1, v2, v3, v4, v5 = st.columns(5)
     show_r = v1.checkbox("Pokaż RSP", True, key="lg_show_r")
     show_l = v2.checkbox("Pokaż LCMS", True, key="lg_show_l")
@@ -3962,12 +4173,18 @@ def tab_long(A):
         st.caption("Trasa jest dzielona na segmenty; w każdym LCMS jest osobno przesuwany względem RSP (maksimum korelacji), "
                    "dzięki czemu na wykresie nie ma narastających przesunięć. Wartości możesz poprawić ręcznie.")
         on = st.checkbox("Włącz dopasowanie segmentów", False, key="sg_on")
-        g1, g2, g3, g4, g5 = st.columns(5)
-        seg_len = g1.number_input("Długość segmentu [m]", 50, 5000, 250, 50, key="sg_len")
-        max_lag = g2.number_input("Maks. przesunięcie ± [m]", 2, 300, 30, 2, key="sg_max")
-        col_ = g3.selectbox("Seria do dopasowania", ["Max", "L", "R"], key="sg_col")
-        hp_ = g4.number_input("Filtr górnoprzepustowy [m]", 0, 1001, 101, 10, key="sg_hp")
-        mc_ = g5.number_input("Min. korelacja", 0.0, 1.0, 0.2, 0.05, key="sg_minc")
+        g1, g2, g3, g4, g5 = st.columns(5)  # pola: długość, maks. przesunięcie, seria, filtr, min. korelacja
+        seg_len = g1.number_input("Długość segmentu [m]", 50, 5000, 250, 50, key="sg_len",
+                                  help="Na odcinki takiej długości dzielona jest trasa; każdy przesuwany osobno.")
+        max_lag = g2.number_input("Maks. przesunięcie ± [m]", 2, 300, 30, 2, key="sg_max",
+                                  help="Największe dodatkowe przesunięcie LCMS dopuszczone w jednym segmencie (w obie strony).")
+        col_ = g3.selectbox("Seria do dopasowania", ["Max", "L", "R"], key="sg_col", help="Którą koleinę dopasowywać (zalecane: Max).")
+        hp_ = g4.number_input("Filtr górnoprzepustowy [m]", 0, 1001, 101, 10, key="sg_hp",
+                              help="Od obu krzywych odejmowana jest ich średnia krocząca z takiej długości [m] (domyślnie 101 m ≈ 100 m). "
+                                   "Dzięki temu pozostają tylko szybkie zmiany koleiny (wzloty i spadki na dystansie kilkudziesięciu metrów), "
+                                   "a wolne różnice poziomu między systemami nie wpływają na dopasowanie. 0 = bez filtra.")
+        mc_ = g5.number_input("Min. korelacja", 0.0, 1.0, 0.2, 0.05, key="sg_minc",
+                              help="Jeśli po przesunięciu korelacja w segmencie jest niższa niż ta wartość, segment pozostaje bez przesunięcia (dane zbyt słabe).")
         if on:
           try:
             sig = (int(seg_len), int(max_lag), col_, int(hp_), float(mc_), float(A["a0"]), float(A["a1"]),
@@ -4028,7 +4245,18 @@ def tab_long(A):
         if both:
             tr.append({"col": f"LCMSc_{key}", "name": f"LCMS (łata) {lab}", "color": "#8fd18f", "dash": "dot"})
         plot(fig_longitudinal(p, tr, f"Koleina {lab} – RSP vs LCMS", view, bands=bands, uirev="lg" + key, extra_vlines=marks), "lg_" + key)
-    roll = st.slider("Okno średniej kroczącej różnicy [m]", 11, 1001, 101, 10, key="lg_roll")
+    roll = st.slider("Okno średniej kroczącej różnicy [m]", 11, 1001, 101, 10, key="lg_roll",
+                     help="Długość okna [m], w którym liczona jest średnia różnica LCMS − RSP (fioletowa gruba linia). Surowa różnica co 1 m jest "
+                          "bardzo „poszarpana” przez szum, więc uśrednia się ją po kilkudziesięciu–stu metrach, żeby zobaczyć systematyczny "
+                          "kierunek różnic. 101 m (≈ 100 m) to rozsądny kompromis: mniejsze okno pokazuje więcej szczegółów, większe – gładszy trend.")
+    explain("Jak czytać wykres „Różnica LCMS − RSP wzdłuż trasy”",
+            "Dla każdego metra liczona jest różnica **LCMS minus RSP** (w mm). **Jasnofioletowa cienka linia** to różnica w każdym metrze, "
+            "**gruba fioletowa** to jej średnia krocząca. Zielony pas wokół zera to tolerancja zgodności ustawiona w panelu bocznym.\n\n"
+            "- Gruba linia **w zielonym pasie, blisko 0** – systemy są zgodne na tym odcinku.\n"
+            "- Gruba linia **powyżej 0** – LCMS pokazuje koleiny głębsze niż RSP; **poniżej 0** – płytsze.\n"
+            "- **Powolna zmiana** wartości na kilkuset metrach – różnica kalibracji/nawierzchni (np. inny typ asfaltu, mokra jezdnia).\n"
+            "- **Szeroki rozrzut cienkiej linii** przy gładkiej grubej – dominuje szum pojedynczych metrów, systematyczny błąd jest mały.\n"
+            "- **Nagłe, krótkie piki** – miejsca do sprawdzenia ręcznie (patrz tabela poniżej).")
     plot(fig_diff_along(p, view=view, roll=roll, tol=A["tol"], uirev="lgd"), "lg_diff")
     with st.expander("Największe rozbieżności (|LCMS − RSP| dla koleiny maks., średnia z 20 m)"):
         d = (p["LCMS_Max"] - p["RSP_Max"]).abs()
@@ -4052,9 +4280,21 @@ def tab_dsn(A):
     if len(hm) == 0:
         st.info("Brak odcinków do oceny.")
         return
+    explain("Co to jest ocena Hm i klasy A–D",
+            "**Hm** to wskaźnik głębokości koleiny dla jednego odcinka (domyślnie 50 m) przyjęty w **DSN 2019** (Diagnostyka Stanu Nawierzchni GDDKiA). "
+            "Dla każdego odcinka bierze się 50 pomiarów koleiny (co 1 m): **E** = średnia głębokość, **Dh** = odchylenie standardowe (jak bardzo "
+            "wartości się różnią). Wskaźnik: **Hm = E + 2·Dh**, zaokrąglony do pełnych mm. Dzięki dodaniu 2·Dh odcinek z nierówną, miejscami "
+            "bardzo głęboką koleiną dostaje gorszą ocenę niż odcinek równomiernie płytki.\n\n"
+            + DSN_LEGEND + "\n\n"
+            "**Skróty:** L_KOL – lewa koleina, P_KOL – prawa koleina, MAX_KOL – większa z nich w każdym metrze. "
+            "**Słupki:** pełne = RSP, kreskowane (przezroczyste) = LCMS; kolor słupka = klasa; przerywane linie poziome to progi klas.")
     cfg = [("L_KOL", "Lewa koleina (L_KOL)"), ("P_KOL", "Prawa koleina (P_KOL)"), ("MAX_KOL", "Koleina maksymalna (MAX_KOL)")]
     for pre, title in cfg:
         plot(make_50m_bar_chart(hm, pre, title, A["sec_len"]), "dsn_bar_" + pre)
+    explain("Jak czytać pasek klas DSN",
+            "Dwa kolorowe paski jeden pod drugim: górny to klasy wg **RSP**, dolny wg **LCMS**; każdy kolorowy prostokąt to jeden odcinek "
+            "(domyślnie 50 m). Kolory: **jasnozielony A**, **ciemnozielony B**, **żółty C**, **czerwony D**. Jeśli oba paski mają ten sam kolor w tym samym "
+            "miejscu – oba systemy ocenili odcinek tak samo. Różnica kolorów pokazuje miejsca, w których oceny się rozchodzą.")
     plot(fig_class_strip(hm, "MAX_KOL"), "dsn_strip")
     M, cs = class_confusion(hm["RSP MAX_KOL Hm"].values, hm["LCMS MAX_KOL Hm"].values)
     if cs.get("n", 0):
@@ -4065,7 +4305,10 @@ def tab_dsn(A):
             st.metric("Zgodność klas (dokładna)", f"{cs['exact']:.0f}%")
             st.metric("Zgodność ±1 klasa", f"{cs['within1']:.0f}%")
             st.metric("Kappa ważona", nice_number(cs["kappa_w"], 2))
-            st.write(f"LCMS wskazuje wyższą klasę (gorszy stan) na {cs['lcms_higher']:.0f}% odcinków, niższą na {cs['lcms_lower']:.0f}%.")
+            st.write(f"LCMS wskazuje **gorszy stan** niż RSP (np. klasa C zamiast B) na {cs['lcms_higher']:.0f}% odcinków, "
+                     f"**lepszy stan** (np. A zamiast B) na {cs['lcms_lower']:.0f}%. Na pozostałych odcinkach klasy są takie same.")
+            st.caption("Macierz: wiersz = klasa wg RSP, kolumna = klasa wg LCMS. Liczby na przekątnej to odcinki ocenione tak samo. "
+                       "„±1 klasa” = klasy różnią się najwyżej o jeden stopień. Kappa ważona: 1 = pełna zgodność, 0 = zgodność taka jak przypadkowa.")
     show = hm.copy()
     for pre in ("L_KOL", "P_KOL", "MAX_KOL"):
         for s_ in ("RSP", "LCMS"):
@@ -4073,7 +4316,22 @@ def tab_dsn(A):
             show[c] = show[c].map(lambda k: f"{DSN_EMOJI.get(k, '')} {k}")
     keep = ["Odcinek", "n RSP", "n LCMS", "Pokrycie %"] + [f"{s_} {pre} {q}" for pre in ("L_KOL", "P_KOL", "MAX_KOL")
                                                               for s_ in ("RSP", "LCMS") for q in ("Hm", "Klasa")]
-    wide(st.dataframe, show[[c for c in keep if c in show.columns]], hide_index=True)
+    st.markdown("**Porównanie odcinków: pikietaż, koleina LCMS, koleina RSP** (wskaźnik Hm [mm])")
+    cmp_cols = {"Odcinek": hm["Odcinek"]}
+    for pre, nm in (("L_KOL", "lewa"), ("P_KOL", "prawa"), ("MAX_KOL", "maks.")):
+        if f"LCMS {pre} Hm" in hm.columns and f"RSP {pre} Hm" in hm.columns:
+            cmp_cols[f"LCMS {nm}"] = hm[f"LCMS {pre} Hm"]
+            cmp_cols[f"RSP {nm}"] = hm[f"RSP {pre} Hm"]
+            cmp_cols[f"Δ {nm} (LCMS−RSP)"] = hm[f"LCMS {pre} Hm"] - hm[f"RSP {pre} Hm"]
+    cmp_cols["Klasa LCMS"] = hm["LCMS MAX_KOL Klasa"].map(lambda k: f"{DSN_EMOJI.get(k, '')} {k}") if "LCMS MAX_KOL Klasa" in hm.columns else ""
+    cmp_cols["Klasa RSP"] = hm["RSP MAX_KOL Klasa"].map(lambda k: f"{DSN_EMOJI.get(k, '')} {k}")
+    wide(st.dataframe, pd.DataFrame(cmp_cols), hide_index=True)
+    st.caption("Δ dodatnia = LCMS pokazuje większą koleinę niż RSP. Klasa dotyczy kolein maksymalnych.")
+    with st.expander("Tabela szczegółowa (z liczbą profili i klasami dla lewej/prawej/maksymalnej koleiny)"):
+        st.markdown("**n RSP / n LCMS** – ile pojedynczych profili (pomiarów co 1 m) z danego systemu trafiło do odcinka (dla odcinka 50 m "
+                    "maksymalnie 50). **Pokrycie %** – jaka część odcinka ma dane z obu systemów. **L_KOL / P_KOL / MAX_KOL Hm** – wskaźnik Hm "
+                    "[mm] dla lewej, prawej i maksymalnej koleiny; **Klasa** – klasa A–D na jego podstawie.")
+        wide(st.dataframe, show[[c for c in keep if c in show.columns]], hide_index=True)
     st.download_button("Pobierz tabelę odcinków (CSV)", hm.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
                        "ocena_odcinkowa_DSN.csv", "text/csv", key="dl_hm_csv")
 
@@ -4086,32 +4344,82 @@ def tab_stats(A):
         st.info("Za mało wspólnych punktów.")
         return
     stx = get_stats(A)
+    explain("Co oznaczają miary w tabeli (słowniczek)", STATS_GLOSSARY)
     wide(st.dataframe, stats_table(stx, A["tol"]), hide_index=True, height=560)
     sel = st.radio("Seria do wykresów", ["Max", "L", "R"], horizontal=True, key="st_sel",
                    format_func=lambda k: {"Max": "Maksymalna", "L": "Lewa", "R": "Prawa"}[k])
     a, b = v["RSP_" + sel].values, v["LCMS_" + sel].values
     lab = {"Max": "KOLEINA MAKSYMALNA", "L": "LEWA KOLEINA", "R": "PRAWA KOLEINA"}[sel]
     fig, md, sd, lu, ll = build_bland_altman_fig(a, b, lab)
+    explain("Jak czytać wykres Blanda–Altmana",
+            "Każdy punkt to jeden metr drogi. **Oś pozioma:** średnia z obu systemów [mm] (czyli „jak głęboka jest koleina”). **Oś pionowa:** różnica "
+            "LCMS − RSP [mm]. **Linia środkowa** = bias (średnia różnica); **dwie linie przerywane** = granice zgodności (bias ± 1,96·SD): "
+            "95% metrów mieści się między nimi.\n\n"
+            "- Chmura leży **wokół zera** i jest wąska – systemy są zgodne.\n"
+            "- Chmura **przesunięta w górę/dół** – systematyczna różnica poziomu.\n"
+            "- Chmura **rozchyla się w prawo** – im głębsza koleina, tym większa niezgodność.\n"
+            "- Chmura **nachylona** (linia trendu) – błąd proporcjonalny: np. LCMS zawyża głębokie koleiny, a przy płytkich jest zgodny.")
     plot(fig, "st_ba")
     c1, c2 = st.columns(2)
     with c1:
         plot(fig_scatter_xy(a, b, f"LCMS vs RSP – {lab.lower()}", st_=stx.get(sel)), "st_sc")
+        st.caption("**Wykres rozrzutu.** Punkt = jeden metr: poziomo RSP, pionowo LCMS. Im ciemniejszy kolor, tym więcej metrów. Czarna przerywana = idealna zgodność (1:1). "
+                   "Czerwona = prosta regresji (MNK), pomarańczowa kropkowana = regresja ortogonalna. Gdy linie leżą na przekątnej, systemy są zgodne; "
+                   "nachylenie > 1 oznacza, że LCMS rośnie szybciej niż RSP (zawyża głębokie koleiny).")
     with c2:
         plot(fig_diff_hist(a, b, A["tol"]), "st_hist")
+        st.caption("**Rozkład różnic LCMS − RSP.** Słupki pokazują, ile metrów miało daną różnicę. Niebieska linia = bias (średnia różnica), czerwone przerywane = granice "
+                   "zgodności, zielony pas = tolerancja. Wąski, symetryczny wykres wokół zera = dobra zgodność; przesunięty = różnica poziomu; szeroki = duży rozrzut.")
     c3, c4 = st.columns(2)
     with c3:
         plot(fig_ecdf(a, b, A["tol"]), "st_ecdf")
+        st.caption("**Dystrybuanta |LCMS − RSP|** (jak szybko rośnie odsetek zgodnych punktów). Poziomo: wartość bezwzględna różnicy [mm]; pionowo: jaki % metrów ma różnicę "
+                   "mniejszą lub równą tej wartości. Pionowe linie to 1, 2, 3 i 5 mm. Przykład: jeśli krzywa przy 2 mm ma 74%, to 74% metrów różni się o nie więcej niż 2 mm. "
+                   "Im szybciej krzywa dochodzi do 100%, tym lepiej.")
     with c4:
         plot(fig_box_by_depth(a, b), "st_box")
+        st.caption("**Różnice w przedziałach głębokości.** Dla każdego przedziału (wg średniej z obu systemów) wykres pudełkowy różnic LCMS − RSP: pudełko = środkowe 50% "
+                   "metrów, linia w pudełku = mediana, wąsy = zakres. Jeśli pudełka rosną nad zero przy głębokich koleinach, LCMS je zawyża.")
     st.markdown("**Zgodność w przedziałach głębokości**")
-    wide(st.dataframe, depth_bin_table(a, b, tol=A["tol"]), hide_index=True)
+    by_ = st.radio("Przedziały wyznaczać według", ["średniej z obu systemów", "wartości RSP (odniesienie)"], horizontal=True, key="st_by",
+                   help="Przedziały wg RSP odpowiadają na pytanie „jak LCMS mierzy miejsca, w których RSP wskazał daną głębokość”. "
+                        "Przedziały wg średniej są mniej obciążone szumem pomiaru, dlatego zalecane do oceny, czy LCMS zawyża duże wartości.")
+    dtab = depth_bin_table(a, b, tol=A["tol"], by="rsp" if by_.startswith("wartości") else "mean")
+    wide(st.dataframe, dtab, hide_index=True)
+    try:
+        hi_ = dtab[dtab["Przedział (średnia)"].astype(str).str.startswith("≥")]
+        lo_ = dtab[dtab["Przedział (średnia)"].astype(str).str.startswith("0–5")]
+        if len(hi_) and len(lo_):
+            bh, bl = float(hi_["Bias [mm]"].iloc[0]), float(lo_["Bias [mm]"].iloc[0])
+            st.info(f"Przy koleinach ≥ 30 mm średnia różnica LCMS − RSP wynosi **{bh:+.2f} mm**, przy koleinach do 5 mm: **{bl:+.2f} mm**. "
+                    + ("LCMS zawyża głębokie koleiny względem RSP." if bh > bl + 1.0 else
+                       "LCMS nie zawyża głębokich kolein w istotnym stopniu względem RSP." if bh <= bl + 0.5 else
+                       "Zawyżenie głębokich kolein jest niewielkie – oceń je razem z wykresem rozrzutu."))
+    except Exception:  # noqa: BLE001
+        pass
+    explain("Co pokazuje tabela przedziałów głębokości",
+            "Metry drogi są dzielone na przedziały głębokości (0–5, 5–10, … ≥30 mm). Dla każdego: **n** – liczba metrów, **RSP śr. / LCMS śr.** – średnie "
+            "głębokości z obu systemów, **Bias** – średnia różnica LCMS − RSP (dodatnia = LCMS głębiej), **SD różnic** – rozrzut różnic, **RMSE** – typowy błąd, "
+            "**|Δ| ≤ tolerancja [%]** – odsetek metrów mieszczących się w tolerancji. To najlepsze miejsce, żeby zobaczyć, czy błąd zależy od głębokości koleiny.")
     st.markdown("**Analiza RPD (układ GDDKiA: 0–30% i >30%)**")
+    explain("Co to jest RPD",
+            "**RPD** (względna różnica procentowa) = |LCMS − RSP| / średnia z obu wyników × 100%. Pokazuje, jak duża jest różnica **w stosunku do wielkości koleiny** "
+            "(2 mm różnicy przy koleinie 5 mm to 40%, a przy koleinie 20 mm – 10%). Tabela dzieli metry na te, w których RPD ≤ 30% (zgodne) i > 30% (niezgodne), i dla "
+            "każdej grupy podaje, w ilu metrach RSP było głębsze, wyniki były równe lub LCMS było głębsze. Ten układ stosuje GDDKiA w swoich analizach porównawczych. "
+            "Przy płytkich koleinach RPD łatwo przekracza 30% nawet przy drobnych różnicach, więc zawsze oceniaj go razem z tabelą głębokości.")
     wide(st.dataframe, build_rpd_table_df(a, b), hide_index=True)
     with st.expander("RPD w drobniejszych przedziałach"):
         wide(st.dataframe, rpd_fine_table(a, b), hide_index=True)
     M, cs = class_confusion(a, b)
     if cs.get("n", 0):
         st.markdown("**Klasy DSN co 1 m (macierz pomyłek)**")
+        explain("Jak czytać macierz pomyłek",
+                "Każdy metr drogi ma klasę wg RSP i klasę wg LCMS (A–D, wg głębokości koleiny w tym metrze). Macierz zlicza wszystkie kombinacje: "
+                "**wiersz = klasa wg RSP, kolumna = klasa wg LCMS**. Liczby na **przekątnej** (A–A, B–B, C–C, D–D) to metry ocenione identycznie. "
+                "Liczby poza przekątną to „pomyłki”: **nad przekątną** – LCMS ocenia gorzej niż RSP (np. RSP: B, LCMS: C), **pod przekątną** – "
+                "LCMS ocenia lepiej. Im bliżej przekątnej leży większość liczb, tym zgodniejsze są oceny. Zgodność ±1 klasa jest zwykle dużo wyższa "
+                "niż dokładna, bo większość różnic to jeden stopień. **Kappa** poprawia procent zgodności o zgodność przypadkową (0 = jak losowo, "
+                "1 = pełna zgodność); **kappa ważona** karze mocniej różnice o 2–3 klasy.")
         plot(fig_confusion(M), "st_conf")
         st.write(f"Zgodność dokładna {cs['exact']:.1f}%, ±1 klasa {cs['within1']:.1f}%, kappa {cs['kappa']:.2f}, kappa ważona {cs['kappa_w']:.2f}.")
     st.markdown("**Zgodność wzdłuż trasy**")
@@ -4120,9 +4428,19 @@ def tab_stats(A):
     rh = wcol[1].number_input("Krok [m]", 50, 2000, 100, 50, key="st_rh")
     roll = rolling_agreement(v, int(rw), int(rh), "RSP_" + sel, "LCMS_" + sel)
     if len(roll):
+        explain("Jak czytać wykres „Zgodność w oknach przesuwnych”, Bias i RMSE",
+                "Odcinek jest dzielony na okna (np. 500 m co 100 m) i w każdym liczone są miary zgodności; trzy panele pokazują ich przebieg wzdłuż drogi.\n\n"
+                "- **Panel 1:** średnia koleina RSP i LCMS w oknie.\n"
+                "- **Panel 2 – Bias:** średnia różnica LCMS − RSP w oknie (dodatni = LCMS głębiej). **RMSE** (czerwona kropkowana): typowa wielkość błędu "
+                "(pierwiastek ze średniego kwadratu różnic) – zawsze ≥ 0 i zawiera zarówno systematyczne przesunięcie, jak i rozrzut. Gdy RMSE ≈ |Bias|, "
+                "błąd jest głównie systematyczny; gdy RMSE ≫ |Bias|, dominuje rozrzut (szum).\n"
+                "- **Panel 3 – korelacja r:** spadek r w jakimś oknie to często miejsce błędu pikietażu, ronda lub robót.\n\n"
+                "Takie okna warto obejrzeć w zakładce „Przebieg wzdłużny” i „Przekrój poprzeczny”.")
         plot(fig_rolling(roll), "st_roll")
     sec = section_agreement(v, 1000.0, origin=A["a0"], a_col="RSP_" + sel, b_col="LCMS_" + sel, tol=A["tol"])
     if len(sec):
+        st.caption("**Bias na odcinkach 1 km:** średnia różnica LCMS − RSP na każdym kilometrze. Czerwone słupki – LCMS głębiej, niebieskie – płycej. "
+                   "Pozwala szybko znaleźć kilometry, na których systemy różnią się najbardziej.")
         plot(fig_section_bars(sec, "Bias [mm]", "Bias na odcinkach 1 km"), "st_secbias")
         wide(st.dataframe, sec.drop(columns=["Od [m]", "Do [m]"]), hide_index=True)
         A["memo"]["sec_tbl"] = sec
@@ -4135,6 +4453,7 @@ def tab_map(A):
     lg = A["lcms"].get("gps") if A["lcms"] else None
     p = A["pairs"]
     fig = go.Figure()
+    map_layers = None
     lat_all, lon_all = [], []
     if rg is not None and len(rg):
         g = rg[(rg["chain_m"] >= A["a0"]) & (rg["chain_m"] <= A["a1"])]
@@ -4158,13 +4477,35 @@ def tab_map(A):
         if len(pp):
             lat = np.interp(pp["Pikietaz"], gg["chain_m"], gg["LAT"])
             lon = np.interp(pp["Pikietaz"], gg["chain_m"], gg["LON"])
-            cols = [get_dsn_color(get_dsn_class(h)) for h in pp["RSP_Max"]]
-            txt = [f"{km_str(c)}<br>RSP {r:.1f} mm<br>LCMS {l:.1f} mm" for c, r, l in zip(pp["Pikietaz"], pp["RSP_Max"], pp["LCMS_Max"])]
-            fig.add_trace(make_map_trace(lat, lon, "markers", marker=dict(size=7, color=cols), name="klasa RSP (Max)", text=txt))
+            sysn = st.radio("Koloruj ślad klasą wg", ["RSP", "LCMS"], horizontal=True, key="map_sys",
+                            help="Kolor = klasa DSN odcinka 50 m (wg koleiny maksymalnej) z wybranego systemu.")
+            hm_ = get_hm(A)
+            ccol = f"{sysn} MAX_KOL Klasa"
+            if len(hm_) and ccol in hm_.columns:
+                od, dd, kl = hm_["Od [m]"].values, hm_["Do [m]"].values, hm_[ccol].values
+                idx = np.clip(np.searchsorted(od, pp["Pikietaz"].values, side="right") - 1, 0, len(od) - 1)
+                classes = [kl[i] if od[i] <= c <= dd[i] + 1 else "?" for i, c in zip(idx, pp["Pikietaz"].values)]
+            else:
+                classes = [get_dsn_class(h) for h in pp[f"{sysn}_Max"]]
+            txt = [f"{km_str(c)}<br>klasa {k}<br>RSP {r:.1f} mm<br>LCMS {l:.1f} mm"
+                   for c, k, r, l in zip(pp["Pikietaz"], classes, pp["RSP_Max"], pp["LCMS_Max"])]
+            cl_arr = np.array(classes)
+            for k, nm in (("A", "A (Hm < 11 mm)"), ("B", "B (11–20 mm)"), ("C", "C (21–30 mm)"), ("D", "D (≥ 31 mm)")):
+                m_ = cl_arr == k
+                if m_.any():
+                    fig.add_trace(make_map_trace(lat[m_], lon[m_], "markers", marker=dict(size=13, color=get_dsn_color(k)),
+                                                 name=f"klasa {nm}", text=[t for t, f_ in zip(txt, m_) if f_]))
+            try:
+                map_layers = class_polygons_layers(lat, lon, classes, half_width_m=6.0)
+            except Exception:  # noqa: BLE001
+                map_layers = None
     if not lat_all:
         st.info("Brak punktów GPS do wyświetlenia w wybranym zakresie.")
         return
-    finish_map(fig, float(np.mean(lat_all)), float(np.mean(lon_all)), map_zoom_for(lat_all, lon_all))
+    finish_map(fig, float(np.mean(lat_all)), float(np.mean(lon_all)), map_zoom_for(lat_all, lon_all), layers=map_layers)
+    st.caption("Kolory: **A** jasnozielony (Hm < 11 mm), **B** ciemnozielony (11–20 mm), **C** żółty (21–30 mm), **D** czerwony (≥ 31 mm). "
+               "Po przybliżeniu mapy kolorowy pas wzdłuż drogi poszerza się (ma stałą szerokość ok. 12 m w terenie), a kropki zostają "
+               "widoczne przy widoku całego odcinka. Najechanie na kropkę pokazuje pikietaż i wartości.")
     plot(fig, "map")
     sep = gps_track_separation(rg, lg, A["off_fn"], p["Pikietaz"].values) if (rg is not None and lg is not None) else None
     if sep is not None and len(sep):
