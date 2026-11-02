@@ -405,6 +405,8 @@ def classify_file(ref):
         txt = head.decode("utf-8-sig", errors="ignore")
         low = txt.lower()
         if "<kolc" in low or "<odcinek>" in low:
+            if _kolc_is_lcms(txt):
+                return TYPE_LCMS_PROFILE, "LCMS – KOLC (same koleiny, bez profili)"
             return TYPE_RSP_KOLC, ""
         if "average rutting" in low and re.search(r"(?im)^\s*from\s*,\s*to\s*,\s*left", txt):
             return TYPE_RSP_KOLC, "RTG (RspWin)"
@@ -1025,6 +1027,68 @@ def parse_pic_xml(ref):
 
 
 # ---------- 3.6 dyspozytor ----------
+def _kolc_is_lcms(txt):
+    """Czy plik KOLC pochodzi z LCMS, a nie z RSP?
+
+    RSP: w nagłówku komentarz z nazwą pliku .RSP (km: … WPASOWANIE: …) albo POMIAR = DGPS / BRAK,
+    a współrzędne występują w części wierszy. LCMS: brak komentarza, POMIAR = GPS przy pustych LAT/LON.
+    """
+    head = txt[:60000]
+    low = head.lower()
+    if "wpasowanie" in low or ".rsp" in low:
+        return False
+    pom = re.findall(r"<POMIAR>([^<]*)</POMIAR>", head)
+    return bool(pom) and all(v.strip().upper() == "GPS" for v in pom)
+
+
+def parse_kolc_lcms(ref):
+    """LCMS: plik KOLC (ODCINEK co 1 m z L_KOL / P_KOL) – same koleiny, bez profili poprzecznych.
+
+    Zwraca zestaw o tym samym układzie co parse_lcms_profiles, z pustymi profilami (complete=False).
+    Plik z LCMS ze zdublowanymi pozycjami (KM_P powtórzone) jest odrzucany z komunikatem – patrz niżej.
+    """
+    txt = ref.read().decode("utf-8-sig", errors="replace")
+    n_blocks = txt.count("<ODCINEK>")
+    if n_blocks == 0:
+        raise ValueError("brak elementów <ODCINEK>")
+
+    def col(tag):
+        vals = re.findall(rf"<{tag}>([^<]*)</{tag}>", txt)
+        if len(vals) != n_blocks:
+            blocks = re.findall(r"<ODCINEK>(.*?)</ODCINEK>", txt, re.S)
+            vals = [dict(re.findall(r"<(\w+)>([^<]*)</\1>", b)).get(tag, "") for b in blocks]
+        return np.array([to_float(v) for v in vals], dtype=float)
+
+    km_p, rl, rr = col("KM_P"), col("L_KOL"), col("P_KOL")
+    chain = np.round(km_p * 1000.0, 3)
+    n_dup = int(len(chain) - len(np.unique(chain)))
+    if n_dup > 0.02 * len(chain):
+        raise ValueError(
+            f"plik KOLC z LCMS ma {n_dup} zdublowanych pozycji (ten sam KM_P występuje wielokrotnie, "
+            f"np. {km_p[np.argmax(pd.Series(chain).duplicated().values)]:.3f}). "
+            "Jest to znany błąd wcześniejszego eksportu (połówki profili z nakładających się okien) – "
+            "z takiego pliku nie da się wiarygodnie odtworzyć pikietażu. Należy wczytać ponownie wygenerowany "
+            "plik KOLC albo plik Profile_DSN_1m (CSV/XLSX).")
+    order = np.argsort(chain, kind="stable")
+    chain, rl, rr = chain[order], rl[order], rr[order]
+    attrs = {}
+    m = re.search(r"<KOLC\b([^>]*)>", txt)
+    if m:
+        attrs = dict(re.findall(r"(\w+)=\"([^\"]*)\"", m.group(1)))
+    notes = [f"KOLC z LCMS: {len(chain)} odcinków 1 m, pikietaż {chain[0] / 1000:.3f}–{chain[-1] / 1000:.3f} km",
+             "tylko koleiny z pliku – bez profili poprzecznych (przekrój i koleiny wyliczone niedostępne)"]
+    if chain[0] < 1000.0:
+        notes.append("pikietaż względny (od 0) – zalecane ustawienie pikietażu początkowego tak jak w RSP")
+    n = len(chain)
+    return {
+        "type": TYPE_LCMS_PROFILE, "name": ref.name, "ident": ref.ident, "kolc": True,
+        "station": chain.astype(np.int64), "rut_l": rl, "rut_r": rr,
+        "ptr": np.zeros(n + 1, dtype=np.int64), "x": np.zeros(0, np.float32), "z": np.zeros(0, np.float32),
+        "complete": np.zeros(n, dtype=bool), "attrs": attrs, "notes": notes, "n": int(n),
+    }
+
+
+
 def parse_source(ref, typ):
     """Wczytuje plik wg typu (bez cache – cache opakowuje warstwa UI)."""
     if typ == TYPE_RSP_RAW:
@@ -1037,6 +1101,9 @@ def parse_source(ref, typ):
     if typ == TYPE_RSP_GPS:
         return parse_rsp_gps(ref)
     if typ == TYPE_LCMS_PROFILE:
+        head = ref.head(4096).decode("utf-8-sig", errors="ignore").lower()
+        if "<kolc" in head or "<odcinek" in head:
+            return parse_kolc_lcms(ref)
         return parse_lcms_profiles(ref)
     if typ == TYPE_LCMS_GPS:
         return parse_pic_xml(ref)
@@ -1414,7 +1481,7 @@ def source_default_start(src):
     """Domyślny pikietaż pierwszej próbki źródła (z nazwy pliku / PIC / km)."""
     t = src["type"]
     guess = 0.0
-    if t == TYPE_LCMS_PROFILE:
+    if t == TYPE_LCMS_PROFILE and not src.get("kolc"):
         g = guess_start_from_filename(src["name"])
         guess = g if g is not None else 0.0
     return guess
@@ -3448,6 +3515,8 @@ def get_lcms_profile(A, c_lcms):
     if k < 0:
         return None
     a, b = L["ptr"][k], L["ptr"][k + 1]
+    if b <= a:
+        return None
     return L["x"][a:b].astype(float), L["z"][a:b].astype(float), k
 
 
@@ -4883,6 +4952,12 @@ def main():
 
     ss = st.session_state
     lcms_source = ss.get("lcms_source", "file")
+    if lcms is not None and any(bool(e.get("src", {}).get("kolc")) for e in entries
+                                if e.get("use", True) and e["type"] == TYPE_LCMS_PROFILE) and not np.any(lcms["complete"]):
+        if lcms_source != "file":
+            st.info("LCMS wczytano z pliku KOLC (same koleiny, bez profili poprzecznych) – użyto koleiny z pliku; "
+                    "koleiny wyliczone z profili i przekrój poprzeczny LCMS są niedostępne.")
+        lcms_source = "file"
     lcms_calc = None
     rsp_s = lcms_s = None
     if lcms is not None:
